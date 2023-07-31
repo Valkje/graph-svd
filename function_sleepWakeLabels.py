@@ -8,10 +8,11 @@ import pandas as pd
 import numpy as np
 from scipy.linalg import svd
 from numpy.linalg import cholesky
+from scipy.linalg import solve_triangular
 from scipy.linalg import inv
 import scipy.sparse as sp
 from sklearn.utils.extmath import randomized_svd
-from sksparse import cholmod
+# from sksparse import cholmod # Cannot get this to work for now
 from scipy.sparse import csgraph
 from skimage import segmentation
 import matplotlib as mpl
@@ -33,7 +34,7 @@ def medianAAIKD(dataframe):
     medAAIKD = np.nanmedian(grpAA['IKD']) if len(grpAA) >= 20 else float('NaN')
     return(medAAIKD)
 
-def get_typingMatrices(df):
+def get_typingMatrices(df: pd.DataFrame):
     """
     Set up Biaffect typing activity and typing speed matrices for graph
     regularized SVD.
@@ -193,8 +194,12 @@ def regularized_svd(X, B, rank, alpha, as_sparse=False):
         I.setdiag(1)
         C = I + (alpha * B)
         print('Computing Cholesky decomposition')
-        factor = cholmod.cholesky(C)
-        D = factor.L()
+
+        # Currently cannot get scikit-sparse to work. TODO: Fix scikit-sparse
+        # factor = cholmod.cholesky(C) 
+        # D = factor.L()
+        D = cholesky(C)
+        
         print('Computing inverse of D.T')
         invDt = sp.linalg.inv(D.T)
         # Eq 11
@@ -210,10 +215,11 @@ def regularized_svd(X, B, rank, alpha, as_sparse=False):
         I = np.eye(B.shape[0])
         C = I + (alpha * B)
         D = cholesky(C)
-        E, S, Fh = svd(X @ inv(D.T))
+        Y_t = solve_triangular(D, X.T, lower=True)
+        E, S, Fh = svd(Y_t)
         E_tilde = E[:, :rank]  # rank-r approximation; H_star = E_tilde (Eq 15)
         H_star = E_tilde  # Eq 15
-        W_star = E_tilde.T @ X @ inv(C)  # Eq 15
+        W_star = solve_triangular(D.T, Y_t @ E_tilde)  # Eq 15
     return H_star, W_star
 
 def get_SVD(activityM, speedM):
