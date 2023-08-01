@@ -75,7 +75,7 @@ def get_typingMatrices(df: pd.DataFrame):
         return pd.DataFrame(), pd.DataFrame()
 
     # remove first and last days
-    activityM = M[1:-1]
+    activityM = M.iloc[1:-1]
 
     # if less than 7 days, skip subject
     if activityM.shape[0] < 7:
@@ -96,7 +96,7 @@ def get_typingMatrices(df: pd.DataFrame):
             daysToRemove.extend(list(range(c, c + 7)))
         c += 1
     # remove rows corresponding to indices in daysToRemove
-    activityM = activityM[~activityM.index.isin([*set(daysToRemove)])]
+    activityM = activityM[~activityM.index.isin([*set(daysToRemove)])] # Should this be loc instead?
 
     # if less than 7 days, skip subject
     if activityM.shape[0] < 7:
@@ -110,7 +110,7 @@ def get_typingMatrices(df: pd.DataFrame):
     speedM = speedM.sort_index(ascending=True)
 
     # remove first and last days
-    speedM = speedM[1:-1]
+    speedM = speedM.iloc[1:-1]
     # remove rows corresponding to indices in daysToRemove
     speedM = speedM[~speedM.index.isin([*set(daysToRemove)])]
     speedM = speedM.replace(np.nan, 0)
@@ -215,11 +215,12 @@ def regularized_svd(X, B, rank, alpha, as_sparse=False):
         I = np.eye(B.shape[0])
         C = I + (alpha * B)
         D = cholesky(C)
-        Y_t = solve_triangular(D, X.T, lower=True)
-        E, S, Fh = svd(Y_t)
+        Y = solve_triangular(D, X.T, lower=True).T
+        E, S, Fh = svd(Y)
         E_tilde = E[:, :rank]  # rank-r approximation; H_star = E_tilde (Eq 15)
         H_star = E_tilde  # Eq 15
-        W_star = solve_triangular(D.T, Y_t @ E_tilde)  # Eq 15
+        # print("C: {}, D: {}, X: {}, Y: {}, E: {}, E_tilde: {}".format(C.shape, D.shape, X.shape, Y.shape, E.shape, E_tilde.shape))
+        W_star = solve_triangular(D.T, Y.T @ E_tilde)  # Eq 15
     return H_star, W_star
 
 def get_SVD(activityM, speedM):
