@@ -54,7 +54,7 @@ def get_typingMatrices(df: pd.DataFrame):
 
     # get matrix of typing activity by day and hour
     df['hour'] = pd.to_datetime(df['keypressTimestampLocal']).dt.hour
-    M = df.groupby(['dayNumber','hour'],as_index = False).size().pivot('dayNumber','hour').fillna(0)
+    M = df.groupby(['dayNumber','hour'],as_index = False).size().pivot(index='dayNumber', columns='hour').fillna(0)
 
     # insert hours with no activity across all days
     missingHours = [h for h in range(24) if h not in list(M['size'].columns)]
@@ -103,7 +103,7 @@ def get_typingMatrices(df: pd.DataFrame):
         return pd.DataFrame(), pd.DataFrame()
 
     # get matrix of typing speed by hour
-    speedM=df.groupby(['dayNumber','hour'],as_index = False).apply(lambda x: medianAAIKD(x)).pivot('dayNumber','hour')
+    speedM=df.groupby(['dayNumber','hour'],as_index = False).apply(lambda x: medianAAIKD(x)).pivot(index='dayNumber', columns='hour')
     speedM.columns = speedM.columns.droplevel(0)
     for h in missingHours:
         speedM.insert(h,h,[np.nan]*speedM.shape[0])
@@ -216,7 +216,7 @@ def regularized_svd(X, B, rank, alpha, as_sparse=False):
         C = I + (alpha * B)
         D = cholesky(C)
         Y = solve_triangular(D, X.T, lower=True).T
-        E, S, Fh = svd(Y)
+        E, s, Fh = svd(Y) # Singular values returned in descending order
         E_tilde = E[:, :rank]  # rank-r approximation; H_star = E_tilde (Eq 15)
         H_star = E_tilde  # Eq 15
         # print("C: {}, D: {}, X: {}, Y: {}, E: {}, E_tilde: {}".format(C.shape, D.shape, X.shape, Y.shape, E.shape, E_tilde.shape))
