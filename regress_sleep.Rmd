@@ -1,0 +1,89 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(lme4)
+library(nlme)
+
+dat_dir <- "~/HPC_project/data"
+```
+
+```{r}
+dat <- read.csv(file.path(dat_dir, "sleep_scores.csv"))
+dat
+```
+
+```{r}
+dat <- dat %>%
+  mutate(
+    id = as.factor(id),
+    sleep_pred_scaled = scale(sleep_pred)
+  )
+```
+
+```{r}
+hist(dat$sleepdur_yest)
+```
+
+```{r}
+hist(dat$sleep_pred)
+```
+
+# Models
+
+```{r}
+m1 <- lmer(sleepdur_yest ~ sleep_pred + (1 | id), data = dat)
+m1
+```
+
+```{r}
+summary(m1)
+```
+
+Decrease correlation by centring predictors:
+
+```{r}
+m1b <- lmer(sleepdur_yest ~ sleep_pred_scaled + (1 | id), data = dat)
+summary(m1b)
+```
+
+The high intercepts and relatively small coefficients in both models indicate that the predictions are still flawed: Ideally, we would have a one-to-one relationship (1 point increase predicted should coincide with 1 point increase reported). This would boil down to an intercept of 0 and a coefficient of 1.
+
+```{r}
+plot(m1)
+```
+
+```{r}
+qqnorm(resid(m1))
+qqline(resid(m1))
+```
+
+
+```{r}
+re <- ranef(m1)$id[[1]]
+
+qqnorm(re)
+qqline(re)
+```
+
+```{r}
+m2 <- lme(sleepdur_yest ~ sleep_pred, 
+          data = dat, 
+          random = ~ 1 | id,
+          na.action = na.omit)
+m2
+```
+
+```{r paged.print=FALSE}
+summary(m2)
+```
+
+# Errors
+
+```{r}
+hist(dat$sleepdur_yest - dat$sleep_pred, breaks=30)
+```
+
