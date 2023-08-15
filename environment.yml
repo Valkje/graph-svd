@@ -159,4 +159,3 @@ dependencies:
   - zipp=3.11.0
   - zlib=1.2.13
   - zstd=1.5.5
-prefix: /opt/homebrew/anaconda3/envs/graph_svd
