@@ -6,7 +6,7 @@ from os.path import join
 from tqdm import tqdm
 import pickle
 
-dat_dir = '/Users/loranknol/HPC_project/data/'
+dat_dir = '/project_cephfs/3022017.02/projects/lorkno/data'
 
 all_files = sorted(glob.glob("sub-*/preproc/*dat-kp.csv", root_dir=dat_dir, recursive=True))
 
@@ -15,12 +15,20 @@ subs = [re.match(pat, f).group(1) for f in all_files]
 
 gsvd_results = {}
 
-for (sub, file) in tqdm(zip(subs, all_files)):
+# Using zip does not allow tqdm to know the max number of iterations
+n_subs = len(subs)
+for i in tqdm(range(n_subs)):
+    file = all_files[i]
+    sub = subs[i]
+
     # read in keypress file
     dfKP = pd.read_csv(join(dat_dir, file), index_col=0)
     dfKP['date'] = pd.to_datetime(dfKP['keypressTimestampLocal']) \
         .map(lambda x: x.date())
     dfKP['dayNumber'] = dfKP['date'].rank(method='dense')
+
+    # Necessary for joining sleep self-report to the key press data
+    dates = dfKP[['date', 'dayNumber']].drop_duplicates()
 
     ################################################################
     # FIND SLEEP/WAKE LABELS FROM BIAFFECT KEYPRESS DATA FILE
@@ -44,6 +52,7 @@ for (sub, file) in tqdm(zip(subs, all_files)):
     sleepMatrix = sleep.get_sleepWakeLabels(svd)
 
     gsvd_results[sub] = {
+        'dates': dates,
         'Mactivity': Mactivity,
         'Mspeed': Mspeed,
         'svd': svd,
