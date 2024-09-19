@@ -397,10 +397,10 @@ def plot_heatmaps(activityM, speedM, svdM, sleepWakeMatrix):
                 cbar_kws={'label': '# keypresses', 'fraction': 0.043})
     # PLOT 2
     sns.heatmap(speedM, cmap='viridis', ax=ax[0,1], vmin=0, vmax=0.3,
-                cbar_kws={'label': '# keypresses', 'fraction': 0.043})
+                cbar_kws={'label': 'Inter-key delay', 'fraction': 0.043})
     # PLOT 3
     sns.heatmap(svdM, cmap='viridis', ax=ax[1,0],
-                cbar_kws={'label': '# keypresses', 'fraction': 0.043})
+                cbar_kws={'label': 'Typing intensity', 'fraction': 0.043})
     # PLOT 4
     cmap = mpl.colors.LinearSegmentedColormap.from_list(
         'Custom',

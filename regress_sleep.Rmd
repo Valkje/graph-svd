@@ -4,12 +4,18 @@ output: html_notebook
 ---
 
 ```{r setup}
+library(arrow)
 library(tidyverse)
 library(lme4)
 library(nlme)
+library(ggeffects)
 
-dat_dir <- "~/HPC_project/data"
+readRenviron(".env")
+
+dat_dir <- Sys.getenv("DAT_DIR")
 ```
+
+# Old version
 
 ```{r}
 dat <- read.csv(file.path(dat_dir, "sleep_scores.csv"))
@@ -32,7 +38,7 @@ hist(dat$sleepdur_yest)
 hist(dat$sleep_pred)
 ```
 
-# Models
+## Models
 
 ```{r}
 m1 <- lmer(sleepdur_yest ~ sleep_pred + (1 | id), data = dat)
@@ -81,9 +87,105 @@ m2
 summary(m2)
 ```
 
-# Errors
+## Errors
 
 ```{r}
 hist(dat$sleepdur_yest - dat$sleep_pred, breaks=30)
+```
+
+# New version
+
+```{r}
+dat <- read_parquet(file.path(dat_dir, "spleep_pred_10_90.parquet"))
+dat
+```
+
+```{r}
+dat_cmplt <- dat %>%
+  drop_na() %>%
+  mutate(activity_c = scale(activity))
+
+dat_cmplt
+```
+
+Biased because this is always the second block?
+
+```{r}
+dat_test <- dat_cmplt %>%
+  filter(label == "test")
+
+dat_test
+```
+
+
+Slight left-skew, the skew for activity could potentially be prevented by doing better filtering at the GSVD level:
+
+```{r}
+ggplot(dat_test, aes(sleepdur_yest)) +
+  geom_histogram() +
+  labs(x = "Sleep duration")
+
+ggplot(dat_test, aes(activity)) +
+  geom_histogram() +
+  labs(x = "Activity score")
+
+ggplot(dat_test, aes(activity_c)) +
+  geom_histogram()
+
+ggplot(dat_test, aes(activity_c, sleepdur_yest)) +
+  geom_jitter()
+```
+
+More than enough evidence for random slopes and intercepts:
+
+```{r fig.height=8}
+lmList <- nlme::lmList
+
+m_list <- lmList(sleepdur_yest ~ activity_c | subject, data = dat_test)
+
+plot(intervals(m_list))
+```
+
+No correlation between random slope and intercept.
+
+```{r}
+m1 <- lmer(sleepdur_yest ~ activity_c + (activity_c || subject), dat_test)
+
+summary(m1)
+```
+
+There is structure in the residuals. This is because the response variable is discrete. Maybe a classifier makes more sense here.
+
+```{r}
+plot(m1)
+```
+
+Residuals also show some left-skew.
+
+```{r}
+qqnorm(resid(m1))
+qqline(resid(m1))
+
+hist(resid(m1))
+```
+
+Random effects look okay except for that outlier in the bottom left.
+
+```{r}
+re <- ranef(m1)$subject %>%
+  rownames_to_column("subject") %>%
+  pivot_longer(!subject)
+
+ggplot(re, aes(sample = value)) +
+  geom_qq() +
+  geom_qq_line() +
+  facet_wrap(~ name, scales = "free")
+```
+
+```{r fig.height=8}
+plot(predict_response(m1, terms = "activity_c"), show_data = TRUE) +
+  labs(title = "Predicted values of sleep duration", 
+       x = "Activity (centred)", y = "Sleep duration") +
+  theme(text = element_text(size = 16))
 ```
 
