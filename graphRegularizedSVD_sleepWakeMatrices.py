@@ -19,7 +19,7 @@ from scipy.linalg import solve_triangular
 from scipy.linalg import inv
 import scipy.sparse as sp
 from sklearn.utils.extmath import randomized_svd
-from sklearn.preprocessing import normalize
+from sklearn.preprocessing import scale
 # from sksparse import cholmod # Cannot get this to work for now
 from scipy.sparse import csgraph
 from skimage import segmentation
@@ -204,7 +204,7 @@ def _pre_filter(df: pd.DataFrame, participant_mask: pd.Series | None = None):
 
     If `participant_mask` is not provided, a mask will be constructed from the following requirements:
     Participants should have, on average, 1) >= 20% of their daily hours filled with some data,
-    2) >= 50 key presses, and 3) >= 9 days of data 
+    2) >= 50 key presses per hour, and 3) >= 9 days of data 
     (the first and last days will be dropped, resulting in at least a week of data).
 
     Parameters
@@ -285,27 +285,87 @@ def _get_days_to_remove(n_presses_df: pd.DataFrame):
     return daysToRemove
 
 def _get_days_to_remove2(n_presses_df: pd.DataFrame):
-    # Trim off the first and last day
-    n_presses_df_trimmed = n_presses_df.iloc[1:-1]
+    """
+    Return an array of indices of days for which less than 33% of the hours
+    (i.e., fewer than eight hours) contains data.
 
+    Parameters
+    ----------
+    n_presses_df: pd.DataFrame
+        Participant-specific data frame in long format containing
+        the number of key presses.
+
+    Returns
+    -------
+    out: np.ndarray
+        Array of indices for the days that are to be excluded.
+    """
     
+    n_presses_binary = n_presses_df > 0
+    # n_presses_nan = n_presses_df.where(n_presses_df > 0)
+    
+    perc_hours_active = n_presses_binary.mean(axis=1)
+    # median_n_presses = n_presses_nan.median(axis=1)
+
+    # Percentage is hard-coded for now
+    day_mask: pd.Series = perc_hours_active >= 0.33
+    
+    # dayNumber index is turned into a column
+    day_mask_df = day_mask.reset_index(name='included')
+
+    excluded_df = day_mask_df.loc[~day_mask_df['included']]
+
+    return excluded_df.index.values
 
 def _remove_days(participant_dict: dict[str, pd.DataFrame]):
-    cleaned_dict = {}
-    
-    days_to_remove = _get_days_to_remove(participant_dict['n_presses'])
-    
-    for var, df in participant_dict.items():
-        # Create contiguous index from 0 to nrow(df), then check which indices stay
-        day_mask = ~np.isin(np.arange(len(df.index)), days_to_remove)
+    """
+    For all data frames of a specific participant, 
+    remove days that don't have enough data.
 
-        cleaned_dict[var] = df.iloc[day_mask]
+    Parameters
+    ----------
+    participant_dict: dict[str, pd.DataFrame]
+        Dictionary of modalities (keys) and the corresponding
+        day-by-hour data frames.
+
+    Returns
+    -------
+    cleaned_dict: dict[str, pd.DataFrame]
+        Same dictionary as input but with unsatisfactory days removed.
+    """
+    
+    cleaned_dict = {}
+
+    df = participant_dict['n_presses']
+    
+    # Create contiguous index from 0 to nrow(df), 
+    # then check which indices should go and invert
+    days_to_remove = _get_days_to_remove2(df)
+    day_mask = ~np.isin(np.arange(len(df.index)), days_to_remove)
+
+    cleaned_dict = {var: df.iloc[day_mask, :] for var, df in participant_dict.items()}
 
     # cleaned_dict = {var: df[~df.index.isin(days_to_remove, level='dayNumber')] for var, df in participant_dict.items()}
 
     return cleaned_dict
 
 def _post_filter(dats_dict: dict[str, dict[str, pd.DataFrame]]):
+    """
+    For every participant, remove days that don't have enough data.
+
+    Parameters
+    ----------
+    dats_dict: dict[str, dict[str, pd.DataFrame]]
+        Dictionary of participants (keys) and their modality dictionaries (values),
+        which contain the modality strings (keys) and the corresponding day-by-hour
+        data frames (values).
+
+    Returns
+    -------
+    out: dict[str, dict[str, pd.DataFrame]]
+        Same dictionary but with unsatisfactory days stripped from the data frames.
+    """
+    
     return {part: _remove_days(dic) for part, dic in dats_dict.items()}
 
 def get_typing_matrices(dat_kp: pd.DataFrame, dat_ses: pd.DataFrame):
@@ -644,7 +704,7 @@ def regularized_svd_chol(
     V_tilde = Vh[:rank, :].T
 
     H_hat = U_tilde 
-    W_hat = solve_triangular(L.T, V_tilde @ np.diag(sigma))  
+    W_hat = solve_triangular(L.T, V_tilde @ np.diag(sigma)).T
 
     return H_hat, W_hat
 
@@ -705,7 +765,7 @@ def regularized_svd_test(
     # Same space as Sigma_tilde @ Vh_tilde
     Y = scipy.linalg.solve_triangular(L, X.T @ U_tilde, lower=True).T
 
-    W_hat = scipy.linalg.solve_triangular(L.T, Y.T)
+    W_hat = scipy.linalg.solve_triangular(L.T, Y.T).T
 
     return W_hat
     
@@ -729,7 +789,7 @@ def calculate_svd(
         If a list of strings, will be used as a (non-strict) subset of the available data modalities in `typing_dfs` 
         which will be used for the SVD. If 'all', will be used to select all of the available modalities.
     rank: int
-        Rank of matrix to approximate.
+        Rank of approximation.
     alpha: float
         Regularisation parameter. Higher values mean more regularisation.
     train_ratio: float
@@ -785,7 +845,8 @@ def calculate_svd(
             warnings.warn(f"No data in training set for participant {subject}")
             continue
 
-        dat_svd_train = normalize(dat_svd_train.T).T
+        # Scale expects a matrix of (n_samples, n_features)
+        dat_svd_train = scale(dat_svd_train.T, with_mean=False).T
 
         # Calculate SVD
         lapl = csgraph.laplacian(W_binary[:split_idx, :split_idx])
@@ -799,7 +860,7 @@ def calculate_svd(
 
         # Check whether test set is not empty
         if dat_svd_test.shape[1] > 0:
-            dat_svd_test = normalize(dat_svd_test.T).T
+            dat_svd_test = scale(dat_svd_test.T, with_mean=False).T
 
             # Calculate SVD for test cases
             lapl = csgraph.laplacian(W_binary[split_idx:, split_idx:])
