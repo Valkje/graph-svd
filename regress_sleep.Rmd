@@ -1,139 +1,370 @@
 ---
-title: "R Notebook"
-output: html_notebook
+title: "Sleep duration regression CLEAR-3"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  pdf_document:
+    toc: yes
+  html_notebook:
+    toc: yes
+    df_print: paged
+    toc_float: yes
+    theme: spacelab
 ---
 
 ```{r setup}
+library(haven)
+library(MuMIn)
 library(arrow)
 library(tidyverse)
 library(lme4)
 library(nlme)
 library(ggeffects)
+library(rlang)
+library(tableone)
+library(r2mlm)
+library(ggpubr)
 
+# Read environment variables from a .env file
 readRenviron(".env")
 
-dat_dir <- Sys.getenv("DAT_DIR")
+dat_dir <- Sys.getenv("DAT_DIR") # Data directory
+man_img_dir <- Sys.getenv("MAN_IMG_DIR") # Manuscript image directory
 ```
 
-# Old version
+# Demographics
 
 ```{r}
-dat <- read.csv(file.path(dat_dir, "sleep_scores.csv"))
-dat
-```
-
-```{r}
-dat <- dat %>%
+dem <- readRDS(file.path(dat_dir, "CLEAR3_Biaffect_Leow", "clear3trait.rds")) %>%
+  as_factor() %>% # Convert haven_labelled variables to factors
   mutate(
-    id = as.factor(id),
-    sleep_pred_scaled = scale(sleep_pred)
+    id = as.character(id),
+    race_clear123 = as_factor(race_clear123),
+    ethnicity = as_factor(ethnicity)
+  ) %>%
+  arrange(id) %>%
+  mutate(across(where(is.character), ~ if_else(.x == "", "Unknown", .x))) %>%
+  rename(Age = age, Gender = gender, `House income` = houseincomecat)
+
+# Given to me by Anisha
+dem[dem$id == "3085",]$Age <- 24
+dem[dem$id == "3100",]$Age <- 23
+
+colnames(dem)
+```
+
+# Oura ring
+
+```{r}
+dat_oura <- readRDS(
+  file.path(dat_dir, "CLEAR3_Biaffect_Leow", "clear3baseline_sleep.rds")) %>%
+  mutate(
+    Oura_Sleep_hour = Oura_Sleep_TST / 3600, # Second to hour
+    sleepdur_yest = sleepdur_yest + 1 # Likert to hours
+  ) %>%
+  filter(id != 3086 | daterated != ymd("2022-07-31")) # Duplicate entries
+
+colnames(dat_oura)
+```
+
+Convert to parquet to make accessible to Python.
+
+```{r}
+dat_oura_raw <- readRDS(
+  file.path(dat_dir, "CLEAR3_Biaffect_Leow", "clear3baseline_sleep.rds"))
+
+write_parquet(dat_oura_raw, file.path(dat_dir, 
+                                      "CLEAR3_Biaffect_Leow", 
+                                      "clear3baseline_sleep.parquet"))
+```
+
+
+```{r fig.height=10}
+ggplot(dat_oura, aes(sleepdur_yest, Oura_Sleep_hour)) +
+  geom_jitter() +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(title = "Recorded vs reported sleep time across participants (jittered)") +
+  xlab("Self-reported sleep duration (hour)") +
+  ylab("Oura-recorded total sleep time (hour)") +
+  theme(text = element_text(size = 18))
+
+ggplot(dat_oura, aes(SleepLNQuality, Oura_Sleep_hour)) +
+  geom_point() +
+  labs(title = "Recorded sleep time vs reported sleep quality across participants") +
+  xlab("Self-reported sleep quality (higher is better)") +
+  ylab("Oura-recorded total sleep time (hour)") +
+  theme(text = element_text(size = 18))
+
+ggplot(dat_oura, aes(sleepdur_yest, SleepLNQuality)) +
+  geom_jitter() +
+  labs(title = "Reported sleep time vs quality across participants") +
+  xlab("Self-reported sleep duration (hour)") +
+  ylab("Self-reported sleep quality (higher is better)") +
+  theme(text = element_text(size = 18))
+```
+
+Participants with self-report data:
+
+```{r}
+tmp <- dat_oura %>%
+  drop_na(sleepdur_yest)
+
+n_distinct(tmp$id)
+```
+
+Participants with Oura data:
+
+```{r}
+tmp <- dat_oura %>%
+  drop_na(Oura_Sleep_TST)
+
+n_distinct(tmp$id)
+```
+
+```{r}
+cor.test(dat_oura$sleepdur_yest, dat_oura$Oura_Sleep_hour, method = "spearman")
+```
+
+# Reading data
+
+```{r}
+# The values in sleepdur_yest are not the raw number of hours slept, but
+# rather an index to the response options:
+# 1 - 2 or fewer hours
+# 2 - 3 hours
+# 3 - 4 hours
+# ...
+# 9 - 10 or more hours
+dat <- read_parquet(file.path(dat_dir, "spleep_pred_10_90_alpha1_2024-11-14.parquet")) %>%
+  mutate(
+    Oura_Sleep_hour = Oura_Sleep_TST / 3600, # Second to hour
+    sleepdur_yest = sleepdur_yest + 1
+  ) %>%
+  filter(subject != "3086" | date != ymd("2022-07-31")) # Duplicate entries
+
+dat_dem <- dat %>%
+  left_join(dem, by = c("subject" = "id"))
+
+dat_cmplt_sr <- dat_dem %>%
+  drop_na(hour_estimate, sleepdur_yest)
+
+dat_cmplt_oura <- dat_dem %>%
+  drop_na(c(hour_estimate, Oura_Sleep_hour))
+
+colnames(dat)
+```
+
+Exclude the first few days (amounts to a total of 115) to prevent leakage of information from the test set via temporal correlation.
+44 participants.
+
+```{r}
+# We can only reliably find the last training days in the full data set
+last_train_days <- dat %>%
+  drop_na(dayNumber) %>%
+  filter(label == "train") %>%
+  group_by(subject) %>%
+  summarize(last_train_day = tail(dayNumber, n = 1))
+
+# Helper function
+filter_mutate <- function(.x) {
+  .x %>%
+    left_join(last_train_days, by = "subject") %>%
+    filter(label == "test", dayNumber > last_train_day + 3) %>% # Don't include first three days in test region
+    mutate(
+      activity_c = scale(activity),
+      hour_estimate_c = drop(scale(hour_estimate)),
+      age_c = scale(Age)
+    ) %>%
+    group_by(subject) %>%
+    mutate(
+      hour_estimate_cluster_centered = drop(scale(hour_estimate, scale = FALSE)),
+      hour_estimate_cluster_mean = mean(hour_estimate, na.rm = TRUE)
+    ) %>%
+    ungroup()
+}
+
+dat_test_sr <- dat_cmplt_sr %>%
+  filter_mutate()
+
+dat_test_oura <- dat_cmplt_oura %>%
+  filter_mutate()
+
+colnames(dat_test_oura)
+```
+
+# Descriptive statistics
+
+```{r fig.height=8, fig.width=8}
+ggplot(dat_oura %>% drop_na(Oura_Sleep_TST), aes(id)) +
+  geom_bar() +
+  labs(x = "Participant ID", y = "Count") +
+  theme(
+    text = element_text(size = 18),
+    axis.text.x = element_text(angle = 90, vjust = 0.5)
+  )
+
+ggplot(dat_test_oura, aes(subject)) +
+  geom_bar() +
+  labs(x = "Participant ID", y = "Count") +
+  theme(
+    text = element_text(size = 18),
+    axis.text.x = element_text(angle = 90, vjust = 0.5)
   )
 ```
 
-```{r}
-hist(dat$sleepdur_yest)
-```
+Self-report.
 
-```{r}
-hist(dat$sleep_pred)
-```
-
-## Models
-
-```{r}
-m1 <- lmer(sleepdur_yest ~ sleep_pred + (1 | id), data = dat)
-m1
-```
-
-```{r}
-summary(m1)
-```
-
-Decrease correlation by centring predictors:
-
-```{r}
-m1b <- lmer(sleepdur_yest ~ sleep_pred_scaled + (1 | id), data = dat)
-summary(m1b)
-```
-
-The high intercepts and relatively small coefficients in both models indicate that the predictions are still flawed: Ideally, we would have a one-to-one relationship (1 point increase predicted should coincide with 1 point increase reported). This would boil down to an intercept of 0 and a coefficient of 1.
-
-```{r}
-plot(m1)
-```
-
-```{r}
-qqnorm(resid(m1))
-qqline(resid(m1))
-```
-
-
-```{r}
-re <- ranef(m1)$id[[1]]
-
-qqnorm(re)
-qqline(re)
-```
-
-```{r}
-m2 <- lme(sleepdur_yest ~ sleep_pred, 
-          data = dat, 
-          random = ~ 1 | id,
-          na.action = na.omit)
-m2
-```
-
-```{r paged.print=FALSE}
-summary(m2)
-```
-
-## Errors
-
-```{r}
-hist(dat$sleepdur_yest - dat$sleep_pred, breaks=30)
-```
-
-# New version
-
-```{r}
-dat <- read_parquet(file.path(dat_dir, "spleep_pred_10_90.parquet"))
-dat
-```
-
-```{r}
-dat_cmplt <- dat %>%
-  drop_na() %>%
-  mutate(activity_c = scale(activity))
-
-dat_cmplt
-```
-
-Biased because this is always the second block?
-
-```{r}
-dat_test <- dat_cmplt %>%
-  filter(label == "test")
-
-dat_test
-```
-
-
-Slight left-skew, the skew for activity could potentially be prevented by doing better filtering at the GSVD level:
-
-```{r}
-ggplot(dat_test, aes(sleepdur_yest)) +
+```{r fig.height=8}
+ggplot(dat_test_sr, aes(sleepdur_yest)) +
   geom_histogram() +
-  labs(x = "Sleep duration")
+  labs(x = "Self-reported sleep duration")
 
-ggplot(dat_test, aes(activity)) +
+ggplot(dat_test_sr, aes(SleepLNQuality)) +
+  geom_histogram() +
+  labs(x = "Self-reported sleep quality")
+
+ggplot(dat_test_sr, aes(activity)) +
   geom_histogram() +
   labs(x = "Activity score")
 
-ggplot(dat_test, aes(activity_c)) +
+ggplot(dat_test_sr, aes(hour_estimate)) +
   geom_histogram()
 
-ggplot(dat_test, aes(activity_c, sleepdur_yest)) +
+ggplot(dat_test_sr, aes(activity_c, sleepdur_yest)) +
   geom_jitter()
+
+ggplot(dat_test_sr, aes(hour_estimate, sleepdur_yest)) +
+  geom_jitter() +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(title = "Reported vs estimated sleep (jittered)", 
+       x = "Hour estimate", y = "Self-reported sleep duration") +
+  theme(text = element_text(size=16))
+
+ggplot(dat_test_sr, aes(hour_estimate, SleepLNQuality)) +
+  geom_jitter(alpha = 0.2) +
+  labs(title = "Reported quality vs estimated duration (jittered)", 
+       x = "Hour estimate", y = "Self-reported sleep quality") +
+  theme(text = element_text(size=16))
+```
+
+Oura ring:
+
+```{r fig.height=8}
+n_presses_breaks = c(400, 1100, 3000, 8100, 22000)
+ggplot(dat_test_oura, aes(hour_estimate, Oura_Sleep_hour)) +
+  geom_jitter(aes(color = n_total_presses)) +
+  geom_abline(intercept = 0, slope = 1) +
+  scale_color_gradient(name = "Number of key presses", trans = "log",
+                       breaks = n_presses_breaks, labels = n_presses_breaks) +
+  labs(title = "Recorded vs estimated sleep (jittered)", 
+       x = "Hour estimate", y = "Oura sleep duration") +
+  theme(text = element_text(size=16))
+
+ggplot(dat_test_oura, aes(hour_estimate, Oura_Sleep_hour)) +
+  geom_jitter(aes(color = n_active_hours)) +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(title = "Recorded vs estimated sleep (jittered)", 
+       x = "Hour estimate", y = "Oura sleep duration") +
+  theme(text = element_text(size=16))
+```
+
+Self-report and Oura ring:
+
+```{r}
+# 1887 observations
+tmp <- dat_oura %>%
+  drop_na(sleepdur_yest, Oura_Sleep_hour)
+
+cor.test(tmp$sleepdur_yest, tmp$Oura_Sleep_hour, method = "spearman")
+```
+
+Overall:
+
+```{r}
+# Include all Oura and self-report data points, filter BiAffect data points
+# based on train/test label
+dat_descr <- dat %>%
+  left_join(last_train_days, by = "subject") %>%
+  select(subject, date, sleepdur_yest, Oura_Sleep_hour, hour_estimate, 
+         label, dayNumber, last_train_day) %>%
+  pivot_longer(sleepdur_yest:hour_estimate, names_to = "variable") %>%
+  filter(variable != "hour_estimate" | (label == "test" & dayNumber > last_train_day + 3))
+
+max_val = round(max(dat_descr$value, na.rm = TRUE))
+
+g_violin <- ggplot(dat_descr, aes(variable, value, fill = variable)) +
+  geom_violin() +
+  geom_jitter(width = 0.05, height = 0, alpha = 0.1) +
+  scale_x_discrete(labels = c("BiAffect", "Oura ring", "Self-report")) +
+  scale_y_continuous(minor_breaks = seq(0, max_val)) +
+  scale_fill_manual(values = c("lightcoral", "aquamarine3", "skyblue4")) +
+  labs(x = NULL, y = "Sleep duration (hour)") +
+  # facet_wrap(~ variable, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 16),
+    legend.position="none",
+    axis.text.x = element_text(size = 16)
+  )
+
+g_violin
+
+ggsave(file.path(man_img_dir, "violin_sleep.pdf"))
+
+dat_descr %>%
+  drop_na(value) %>%
+  group_by(variable) %>%
+  summarize(n())
+```
+
+```{r}
+max_lim <- 19
+r_coord = 15
+
+tmp <- dat_descr %>%
+  pivot_wider(id_cols = c(subject, date), 
+              names_from = variable, values_from = value)
+
+gs <- vector("list", length = 3)
+
+gs[[1]] <- ggplot(tmp, aes(hour_estimate, Oura_Sleep_hour)) +
+  labs(x = "BiAffect sleep duration (hour)", 
+       y = "Oura sleep duration (hour)") +
+  geom_label(aes(x, y), label = expression(r[s] == 0.40), parse = TRUE, 
+             data = data.frame(x = r_coord, y = r_coord)) # Prevent overdrawing
+
+gs[[2]] <- ggplot(tmp, aes(hour_estimate, sleepdur_yest)) +
+  labs(x = "BiAffect sleep duration (hour)", 
+       y = "Self-reported sleep duration (hour)") +
+  geom_label(aes(x, y), label = expression(r[s] == 0.26), parse = TRUE, 
+             data = data.frame(x = r_coord, y = r_coord)) # Prevent overdrawing
+
+gs[[3]] <- ggplot(tmp, aes(sleepdur_yest, Oura_Sleep_hour))+
+  labs(x = "Self-reported sleep duration (hour)", 
+       y = "Oura sleep duration (hour)") +
+  geom_label(aes(x, y), label = expression(r[s] == 0.74), parse = TRUE, 
+             data = data.frame(x = r_coord, y = r_coord)) # Prevent overdrawing
+  
+gs <- lapply(gs, function(g) {
+  g +
+    geom_jitter(width = 0.2, height = 0.2, alpha = 0.5) +
+    xlim(0, max_lim) +
+    ylim(0, max_lim) +
+    coord_fixed() +
+    theme_minimal() +
+    theme(text = element_text(size = 16))
+})
+
+g_scatter <- ggarrange(plotlist = gs, nrow = 1)
+
+g_scatter
+```
+
+```{r fig.height=8}
+ggarrange(g_violin, g_scatter, labels = c("A", "B"), font.label = list(size = 20), nrow = 2)
+
+ggsave(file.path(man_img_dir, "violin_scatter.pdf"))
 ```
 
 More than enough evidence for random slopes and intercepts:
@@ -141,20 +372,22 @@ More than enough evidence for random slopes and intercepts:
 ```{r fig.height=8}
 lmList <- nlme::lmList
 
-m_list <- lmList(sleepdur_yest ~ activity_c | subject, data = dat_test)
+m_list <- lmList(Oura_Sleep_hour ~ hour_estimate_c | subject, data = dat_test_oura, na.action = na.omit)
 
 plot(intervals(m_list))
 ```
 
+# Activity score
+
 No correlation between random slope and intercept.
 
 ```{r}
-m1 <- lmer(sleepdur_yest ~ activity_c + (activity_c || subject), dat_test)
+m1 <- lmer(sleepdur_yest ~ activity_c + (activity_c || subject), dat_test_sr)
 
 summary(m1)
 ```
 
-There is structure in the residuals. This is because the response variable is discrete. Maybe a classifier makes more sense here.
+There is structure in the residuals. This is because the response variable is discrete. Maybe ordinal regression makes more sense here.
 
 ```{r}
 plot(m1)
@@ -187,5 +420,516 @@ plot(predict_response(m1, terms = "activity_c"), show_data = TRUE) +
   labs(title = "Predicted values of sleep duration", 
        x = "Activity (centred)", y = "Sleep duration") +
   theme(text = element_text(size = 16))
+```
+
+# Hour estimate
+
+```{r}
+cor.test(dat_test_sr$hour_estimate, dat_test_sr$sleepdur_yest, method = "spearman")
+```
+
+```{r}
+m2_sr <- lmer(sleepdur_yest ~ hour_estimate_c + (hour_estimate_c | subject), 
+              dat_test_sr)
+
+summary(m2_sr)
+```
+
+To get the p values.
+
+```{r paged.print=FALSE}
+m2_nlme <- lme(sleepdur_yest ~ hour_estimate_c, 
+               data = dat_test_sr, 
+               random = ~ hour_estimate_c | subject)
+
+summary(m2_nlme)
+```
+
+
+```{r}
+plot(m2_sr)
+```
+
+Residuals also show some left-skew.
+
+```{r}
+qqnorm(resid(m2_sr))
+qqline(resid(m2_sr))
+
+hist(resid(m2_sr))
+```
+
+Random effects look okay, although the tails can get a little wonky.
+
+```{r}
+re <- ranef(m2_sr)$subject %>%
+  rownames_to_column("subject") %>%
+  pivot_longer(!subject)
+
+ggplot(re, aes(sample = value)) +
+  geom_qq() +
+  geom_qq_line() +
+  facet_wrap(~ name, scales = "free")
+```
+
+## Prediction
+
+```{r fig.height=8}
+plot(predict_response(m2_sr, terms = "hour_estimate_c"), show_data = TRUE, jitter = 0.1) +
+  labs(title = "Predicted values of sleep duration", 
+       x = "Hour estimate (centred)", y = "Sleep duration") +
+  theme(text = element_text(size = 16))
+```
+
+
+```{r fig.height=8}
+hour_mean <- dat_test_sr$hour_estimate_c %@% "scaled:center"
+hour_sd <- dat_test_sr$hour_estimate_c %@% "scaled:scale"
+
+pr <- predict_response(m2_sr, terms = "hour_estimate_c") %>%
+  as.data.frame() %>%
+  mutate(x = hour_sd * x + hour_mean)
+
+n_presses_breaks = c(400, 1100, 3000, 8100, 22000)
+
+max_est = round(max(dat_test_sr$hour_estimate))
+
+g_pred_sr <- ggplot(pr, aes(x, predicted)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+  geom_line(color = "lightcoral", lwd = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), 
+              fill="lightcoral", alpha = 0.2) +
+  geom_jitter(
+    aes(hour_estimate, sleepdur_yest, color = n_total_presses), 
+    width = 0.2, height = 0.1, alpha = 0.5,
+    data = dat_cmplt_sr) +
+  scale_color_gradient(name = "Number of key presses", transform = "log",
+                       breaks = n_presses_breaks, labels = n_presses_breaks, 
+                       high = "aquamarine3") +
+  scale_x_continuous(minor_breaks = seq(
+    0, max_est
+  )) +
+  scale_y_continuous(minor_breaks = seq(0, 15), limits = c(0, 15)) + 
+  labs(x = "BiAffect-estimated sleep duration (hour)", 
+       y = "Self-reported sleep duration (hour)") +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+  )
+
+g_pred_sr
+
+# ggsave(file.path(man_img_dir, "duration_prediction.pdf"))
+```
+
+```{r}
+r_squared <- r2mlm(m2_sr)
+
+# noquote class
+vars <- r_squared$Decompositions[,1]
+vars_df_sr <- data.frame(variance = unclass(vars)) %>%
+  rownames_to_column("component") %>%
+  filter(component != "fixed, between") %>%
+  mutate(
+    component = case_when(
+      component == "fixed, within" ~ "Fixed effects",
+      component == "slope variation" ~ "Random slope",
+      component == "mean variation" ~ "Random intercept",
+      component == "sigma2" ~ "Residuals"
+    )
+  )
+
+vars_df_sr
+
+cols <- rev(c("skyblue2", "skyblue3", "skyblue4", "grey25"))
+
+g_var_sr <- ggplot(vars_df_sr, aes(1, variance)) +
+  geom_col(aes(fill = fct_rev(component))) +
+  scale_fill_manual(values = cols, name = "Variance component") +
+  labs(x = NULL, y = "Proportion of variance") +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(position = "right") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+  )
+
+g_var_sr
+```
+
+```{r fig.height=8}
+g_legends <- ggarrange(get_legend(g_pred_sr), get_legend(g_var_sr), ncol = 1, align = "v") 
+g_plots <- ggarrange(g_pred_sr, g_var_sr, widths = c(7, 1), legend = "none")
+
+ggarrange(g_plots, g_legends, widths = c(4, 1))
+
+# ggsave(file.path(man_img_dir, "duration_prediction_sr_var.pdf"))
+```
+
+# Predicting Oura ring
+
+```{r}
+cortest <- cor.test(dat_test_oura$hour_estimate, dat_test_oura$Oura_Sleep_hour,
+                    method = "spearman")
+
+cortest
+```
+
+```{r}
+tmp <- dat_test_oura %>%
+  mutate(
+    sedative_YN = as.integer(sedative_YN),
+    stim_YN = as.integer(stim_YN),
+    SSRI = as.integer(SSRI),
+    SNRI = as.integer(SNRI),
+    age_c = drop(age_c)
+  )
+
+m2_oura <- lmer(
+  # Oura_Sleep_hour ~ hour_estimate_c + age_c + sedative_YN + stim_YN + SSRI + SNRI + (hour_estimate_c | subject),
+  Oura_Sleep_hour ~ hour_estimate_c + (hour_estimate_c | subject),
+  tmp)
+
+summary(m2_oura)
+```
+
+```{r paged.print=FALSE}
+m2_oura_nlme <- lme(Oura_Sleep_hour ~ hour_estimate_c, 
+               data = dat_test_oura, 
+               random = ~ hour_estimate_c | subject)
+
+summary(m2_oura_nlme)
+```
+
+```{r}
+get_coef_table <- function(m) {
+  summ <- summary(m)
+  tab <- summ$tTable
+  tab <- tab[2:nrow(tab),]
+  
+  betas <- tab[,1]
+  ses <- tab[,2]
+  p_vals <- tab[,5]
+  
+  data.frame(beta = betas, SE = ses, p = p_vals)
+}
+
+# get_coef_table(m2_oura_nlme)
+```
+
+
+Cluster-centred predictors. Drawback is that the intercept and cluster (participant) means are almost perfectly correlated.
+
+```{r}
+m2_oura_cluster <- lmer(
+  Oura_Sleep_hour ~ hour_estimate_cluster_centered + hour_estimate_cluster_mean + (hour_estimate_cluster_centered | subject),
+  dat_test_oura)
+
+summary(m2_oura_cluster)
+```
+
+
+## Evaluation
+
+```{r}
+plot(m2_oura)
+```
+
+```{r}
+qqnorm(resid(m2_oura))
+qqline(resid(m2_oura))
+
+hist(resid(m2_oura))
+```
+
+Random effects look okay except for that outlier in the bottom left.
+
+```{r}
+re <- ranef(m2_oura)$subject %>%
+  rownames_to_column("subject") %>%
+  pivot_longer(!subject)
+
+ggplot(re, aes(sample = value)) +
+  geom_qq() +
+  geom_qq_line() +
+  facet_wrap(~ name, scales = "free")
+```
+
+```{r}
+r_squared <- r2mlm(m2_oura)
+
+# noquote class
+vars <- r_squared$Decompositions[,1]
+vars_df <- data.frame(variance = unclass(vars)) %>%
+  rownames_to_column("component") %>%
+  filter(component != "fixed, between") %>%
+  mutate(
+    component = case_when(
+      component == "fixed, within" | component == "fixed" ~ "Fixed effects",
+      component == "slope variation" ~ "Random slope",
+      component == "mean variation" ~ "Random intercept",
+      component == "sigma2" ~ "Residuals"
+    )
+  )
+
+vars_df
+
+cols <- rev(c("skyblue2", "skyblue3", "skyblue4", "grey20"))
+
+g_var <- ggplot(vars_df, aes(1, variance)) +
+  geom_col(aes(fill = fct_rev(component))) +
+  scale_fill_manual(values = cols, name = "Variance component") +
+  labs(x = NULL, y = "Proportion of variance") +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(position = "right") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+  )
+
+g_var
+```
+
+```{r}
+r2mlm(m2_oura_cluster)
+```
+
+
+## Prediction
+
+```{r fig.height=8}
+plot(predict_response(m2_oura, terms = "hour_estimate_c"), show_data = TRUE, jitter = 0.1) +
+  labs(title = "Predicted values of sleep duration", 
+       x = "Hour estimate (centred)", y = "Sleep duration") +
+  theme(text = element_text(size = 16))
+```
+
+```{r fig.height=8}
+hour_mean <- dat_test_oura$hour_estimate_c %@% "scaled:center"
+hour_sd <- dat_test_oura$hour_estimate_c %@% "scaled:scale"
+
+pr <- predict_response(m2_oura, terms = "hour_estimate_c") %>%
+  as.data.frame() %>%
+  mutate(x = hour_sd * x + hour_mean)
+
+n_presses_breaks = c(400, 1100, 3000, 8100, 22000)
+
+max_est = round(max(dat_test_oura$hour_estimate))
+
+g_pred <- ggplot(pr, aes(x, predicted)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+  geom_line(color = "lightcoral", lwd = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), 
+              fill="lightcoral", alpha = 0.2) +
+  geom_jitter(
+    aes(hour_estimate, Oura_Sleep_hour, color = n_total_presses), 
+    width = 0.2, height = 0.1,# alpha = 0.5,
+    data = dat_test_oura) +
+  scale_color_gradient(name = "Number of key presses", transform = "log",
+                       breaks = n_presses_breaks, labels = n_presses_breaks, 
+                       high = "aquamarine3") +
+  scale_x_continuous(minor_breaks = seq(0, max_est)) +
+  scale_y_continuous(minor_breaks = seq(0, 15), limits = c(0, 15)) + 
+  labs(x = "BiAffect-estimated sleep duration (hour)", 
+       y = "Oura-estimated sleep duration (hour)") +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+  )
+
+g_pred
+
+# ggsave(file.path(man_img_dir, "duration_prediction_oura.pdf"))
+```
+
+```{r fig.height=8}
+g_legends <- ggarrange(get_legend(g_pred), get_legend(g_var), ncol = 1, align = "v") 
+g_plots <- ggarrange(g_pred, g_var, widths = c(7, 1), legend = "none")
+
+ggarrange(g_plots, g_legends, widths = c(4, 1))
+
+# ggsave(file.path(man_img_dir, "duration_prediction_oura_var.pdf"))
+```
+
+# Demographics
+
+```{r}
+ids <- as.integer(unique(dat_test_sr$subject))
+
+dem_test <- dem %>%
+  filter(id %in% ids) %>%
+  select(!c(id, race_clear123, ethnicity, bmi, filing_status, sex_orient)) %>%
+  select(where(~ !is.numeric(.x) || sum(.x, na.rm = TRUE) > 0)) %>%
+  mutate(across(starts_with("currentdx"), as.logical))
+
+tab_txt <- capture.output(CreateTableOne(data = dem_test)) %>%
+  str_replace("^\\s\\s", "") %>%
+  str_replace("(\\w|\\))\\s+(\\d.*)", "\\1;\\2") %>%
+  str_replace_all("currentdx_(.+) = TRUE \\(%\\);(.*)", "   \\1;\\2")
+
+cat(tab_txt, sep = "\n")
+```
+
+```{r}
+ids <- as.integer(unique(dat_test_oura$subject))
+
+dem_test <- dem %>%
+  filter(id %in% ids) %>%
+  select(!c(id, race_clear123, ethnicity, bmi, filing_status, sex_orient)) %>%
+  select(where(~ !is.numeric(.x) || sum(.x, na.rm = TRUE) > 0)) %>%
+  mutate(across(starts_with("currentdx"), as.logical))
+
+tab_txt <- capture.output(CreateTableOne(data = dem_test)) %>%
+  str_replace("^\\s\\s", "") %>%
+  str_replace("(\\w|\\))\\s+(\\d.*)", "\\1;\\2") %>%
+  str_replace_all("currentdx_(.+) = TRUE \\(%\\);(.*)", "   \\1;\\2")
+
+cat(tab_txt, sep = "\n")
+```
+
+# Druijff-Van de Woestijne
+
+```{r}
+dat_dvdw <- read_parquet(file.path(dat_dir, "dat_dvdw.parquet"))
+
+colnames(dat_dvdw)
+```
+
+```{r}
+dat_dvdw_oura <- dat_dvdw %>%
+  left_join(dat_oura %>% mutate(id = as.character(id)), 
+            by = c("subject" = "id", "date" = "daterated")) %>%
+  drop_na(Oura_Sleep_TST) %>%
+  mutate(
+    kap_c = drop(scale(kap)),
+    n_active_hours_c = drop(scale(n_active_hours)),
+    prev_n_active_hours_c = drop(scale(prev_n_active_hours))
+  )
+
+colnames(dat_dvdw_oura)
+```
+
+```{r}
+m_dvdw <- lmer(Oura_Sleep_hour ~ kap_c + n_active_hours_c + prev_n_active_hours_c + (1 | subject),
+               dat_dvdw_oura)
+
+summary(m_dvdw)
+```
+
+```{r paged.print=FALSE}
+m_dvdw_nlme <- lme(Oura_Sleep_hour ~ kap_c + n_active_hours_c + prev_n_active_hours_c, 
+                   data = dat_dvdw_oura,
+                   random = ~ 1 | subject,
+                   na.action = na.omit)
+
+summary(m_dvdw_nlme)
+```
+
+
+```{r}
+plot(m_dvdw)
+
+qqnorm(resid(m_dvdw))
+qqline(resid(m_dvdw))
+
+hist(resid(m_dvdw))
+
+re <- ranef(m_dvdw)$subject %>%
+  rownames_to_column("subject") %>%
+  pivot_longer(!subject)
+
+ggplot(re, aes(sample = value)) +
+  geom_qq() +
+  geom_qq_line() +
+  facet_wrap(~ name, scales = "free")
+```
+
+```{r}
+plot(predict_response(m_dvdw, terms = "kap_c"), show_data = TRUE) +
+  xlim(-4, 4)
+```
+
+
+```{r fig.height=8}
+kap_mean <- mean(dat_dvdw_oura$kap)
+kap_sd <- sd(dat_dvdw_oura$kap)
+
+pr <- predict_response(m_dvdw, terms = "kap_c") %>%
+  as.data.frame() %>%
+  mutate(x = kap_sd * x + kap_mean)
+
+n_presses_breaks = c(400, 1100, 3000, 8100, 22000)
+
+g_dvdw <- ggplot(pr, aes(x, predicted)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+  geom_line(color = "lightcoral", lwd = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), fill="lightcoral", alpha = 0.2) +
+  geom_point(
+    aes(kap, Oura_Sleep_hour),
+    data = dat_dvdw_oura) +
+  # scale_color_gradient(name = "Number of key presses", transform = "log",
+  #                      breaks = n_presses_breaks, labels = n_presses_breaks, high = "aquamarine3") +
+  scale_x_continuous(minor_breaks = ~ seq(0, 15)) +
+  labs(x = "Keystroke-absence period (hour)", y = "Oura-estimated sleep duration (hour)") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20)
+  )
+
+# ggsave(file.path(man_img_dir, "duration_prediction_dvdw.pdf"))
+
+g_dvdw
+```
+
+```{r}
+r_squared <- r2mlm(m_dvdw)
+
+# noquote class
+vars <- r_squared$Decompositions[,1]
+vars_df <- data.frame(variance = unclass(vars)) %>%
+  rownames_to_column("component") %>%
+  filter(component != "fixed, between", component != "slope variation") %>%
+  mutate(
+    component = case_when(
+      component == "fixed" ~ "Fixed effects",
+      component == "mean variation" ~ "Random intercept",
+      component == "sigma2" ~ "Residuals"
+    )
+  )
+
+vars_df
+
+cols <- rev(c("aquamarine2", "aquamarine3", "grey20"))
+
+g_var_dvdw <- ggplot(vars_df, aes(1, variance)) +
+  geom_col(aes(fill = fct_rev(component))) +
+  scale_fill_manual(values = cols, name = "Variance component") +
+  labs(x = NULL, y = "Proportion of variance") +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(position = "right") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+  )
+
+g_var_dvdw
+```
+
+```{r fig.height=8}
+ggarrange(g_dvdw, g_var_dvdw, widths = c(5, 2))
+
+# ggsave(file.path(man_img_dir, "duration_prediction_oura_var_dvdw.pdf"))
 ```
 
