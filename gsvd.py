@@ -1,10 +1,3 @@
-"""
-@author: Mindy Ross
-python version 3.7.4
-"""
-
-# FUNCTIONS TO GET SLEEP/WAKE LABELS BY HOUR FROM BIAFFECT KEYPRESS FILE
-
 import re
 import glob
 import itertools
@@ -172,7 +165,8 @@ def rank_dates(df: pd.DataFrame, group_by: str = 'subject'):
 
 def _calculate_aaikd(df: pd.DataFrame, group_by: list[str]) -> pd.DataFrame:
     """
-    Calculate the median inter-key delay of alphanumeric-alphanumeric key transitions.
+    Calculate the median inter-key delay of alphanumeric-alphanumeric (or, for 
+    BiAffect 3, alphabet-alphabet) key transitions.
 
     Parameters
     ----------
@@ -187,7 +181,10 @@ def _calculate_aaikd(df: pd.DataFrame, group_by: list[str]) -> pd.DataFrame:
         Long data frame with the group_by columns and the median AAIKD in the `IKD` column.
     """
 
-    df_g = df.loc[(df['keypress_type'] == 'alphanum') & (df['previousKeyType'] == 'alphanum')] \
+    # Keypress type changed in BiAffect 3
+    a_type = 'alphanum' if 'alphanum' in df['keypress_type'].values else 'alphabet'
+    
+    df_g = df.loc[(df['keypress_type'] == a_type) & (df['previousKeyType'] == a_type)] \
         .groupby(group_by)
 
     df_s = df_g.size()
