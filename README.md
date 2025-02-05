@@ -10,7 +10,7 @@ conda env create -f environment.yml
 
 Alternatively, you can install all Python packages manually with pip.
 
-In addition, the code expects a `.env` file to set the path to the proper data directory. This has to be created manually, and should look like this:
+In addition, the code expects a `.env` file to set the path to the proper data directory. This has to be created manually, and should contain:
 
 ```
 DAT_DIR=/path/to/data/dir
