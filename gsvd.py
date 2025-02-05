@@ -772,7 +772,8 @@ def calculate_svd(
         modalities: str | list[str] = 'all',
         rank: int = 1,
         alpha: float = 1,
-        train_ratio: float = 1
+        train_ratio: float = 1,
+        train_tail: bool = False
     ) -> tuple[dict[str, np.ndarray] | dict[str, dict[str, np.ndarray]], dict[str, int]]:
     """
     Calculates a graph-regularised SVD for different participants based on their hourly typing characteristics.
@@ -792,6 +793,8 @@ def calculate_svd(
     train_ratio: float
         Proportion of data (in the interval [0, 1]) that should be allocated to the training set. The remainder
         will go to the test set. If no testing is to be performed, set to 1.
+    train_tail: bool
+        If the training data is taken from the first or last portion of the full data set.
         
     Returns
     -------
@@ -833,9 +836,21 @@ def calculate_svd(
         dat_svd = np.vstack(list(dats_svd.values()))
 
         # Split data into training and testing set
-        split_idx = 24 * int(dat_svd.shape[1] / 24 * train_ratio)
-        dat_svd_train = dat_svd[:, :split_idx]
-        dat_svd_test = dat_svd[:, split_idx:] # Empty if train_ratio is too high
+        n_nodes = dat_svd.shape[1]
+        if not train_tail:
+            split_idx = 24 * int(n_nodes / 24 * train_ratio)
+            dat_svd_train = dat_svd[:, :split_idx]
+            dat_svd_test = dat_svd[:, split_idx:] # Empty if train_ratio is too high
+            
+            lapl_train = csgraph.laplacian(W_binary[:split_idx, :split_idx])
+            lapl_test = csgraph.laplacian(W_binary[split_idx:, split_idx:])
+        else:
+            split_idx = 24 * int(n_nodes / 24 * (1 - train_ratio))
+            dat_svd_train = dat_svd[:, split_idx:]
+            dat_svd_test = dat_svd[:, :split_idx]
+            
+            lapl_train = csgraph.laplacian(W_binary[split_idx:, split_idx:])
+            lapl_test = csgraph.laplacian(W_binary[:split_idx, :split_idx])
 
         if dat_svd_train.shape[1] == 0:
             # raise ValueError(f"No data in training set for participant {subject}")
@@ -846,8 +861,7 @@ def calculate_svd(
         dat_svd_train = scale(dat_svd_train.T, with_mean=False).T
 
         # Calculate SVD
-        lapl = csgraph.laplacian(W_binary[:split_idx, :split_idx])
-        U_tilde, W_hat = regularized_svd_chol(dat_svd_train, lapl, rank, alpha)
+        U_tilde, W_hat = regularized_svd_chol(dat_svd_train, lapl_train, rank, alpha)
         # Get SVD matrix
         svd_mat_train = W_hat.reshape((-1, 24))
 
@@ -860,9 +874,7 @@ def calculate_svd(
             dat_svd_test = scale(dat_svd_test.T, with_mean=False).T
 
             # Calculate SVD for test cases
-            lapl = csgraph.laplacian(W_binary[split_idx:, split_idx:])
-
-            W_hat_test = regularized_svd_test(dat_svd_test, lapl, alpha, U_tilde)
+            W_hat_test = regularized_svd_test(dat_svd_test, lapl_test, alpha, U_tilde)
             svd_mat_test = W_hat_test.reshape((-1, 24))
 
             if svd_mat_test.max() <= 0.00000001:
