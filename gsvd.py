@@ -110,7 +110,6 @@ def pivot_split(df: pd.DataFrame, variables: list[str]):
 
     # Split into a dict of {participant: {variable: DataFrame}}
     dats_dict = {id: {var: df[var].droplevel('subject') for var in variables} for id, df in dats_hour_us.items()}
-    print(dats_dict)
 
     return dats_dict
 
