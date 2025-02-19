@@ -669,14 +669,14 @@ def calculate_svd(
     train_ratio = max(0, min(1, train_ratio))
 
     for subject, dfs in tqdm(typing_dfs.items()):
-        # Necessary to be able to split by data matrix row after flattening
-        n_cols = dfs_svd[modalities[0]].shape[1]
-        
         # Subset the DataFrames to use, convert to flattened np.ndarray
         # TODO: Check that all DataFrames have the same dimensionality
         dfs_svd = {modality: dfs[modality] for modality in modalities}
         dats_svd = {modality: df.to_numpy().flatten() for modality, df in dfs_svd.items()}
 
+        # Necessary to be able to split by data matrix row after flattening
+        n_cols = dfs_svd[modalities[0]].shape[1]
+        
         # Transform to constrain range
         if 'n_presses' in dats_svd:
             dats_svd['n_presses'] = np.log1p(dats_svd['n_presses'])
