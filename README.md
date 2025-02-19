@@ -2,15 +2,19 @@ Code to merge, plot, and analyse key press and sleep data.
 
 ## Getting started
 
-I have included an environment.yml file that can be used to create a conda environment called `graph_svd`. To do so, run:
+I have included an environment.yml file that can be used to create a conda environment called `graph_svd`. (This file was created on Almalinux.) To create the environment, run:
 
 ```console
 conda env create -f environment.yml
 ```
 
-This file was constructed on Almalinux.
-
 Alternatively, you can install all Python packages manually with pip.
+
+In addition, the code expects a `.env` file to set the path to the proper data directory. This has to be created manually, and should contain:
+
+```
+DAT_DIR=/path/to/data/dir
+```
 
 ## Code run-down
 
