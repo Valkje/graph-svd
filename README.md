@@ -1,8 +1,16 @@
 Code to merge, plot, and analyse key press and sleep data.
 
+1. [Getting started](#getting-started)
+2. [BiAffect preprocessing](#biaffect-preprocessing)
+3. [GRSVD calculation](#grsvd-calculation)
+4. [Sleep duration prediction](#sleep-duration-prediction)
+5. [Diurnal rhythm phase extraction](#diurnal-rhythm-phase-extraction)
+
 ## Getting started
 
-I have included an environment.yml file that can be used to create a conda environment called `graph_svd`. (This file was created on Almalinux.) To create the environment, run:
+This project does GRSVD calculation in Python, and most other processing in R.
+
+For Python (version 3.11.4), the environment.yml file can be used to create a conda environment called `graph_svd` that contains the necessary packages. (This file was created on Almalinux.) To create the environment, run:
 
 ```console
 conda env create -f environment.yml
@@ -10,13 +18,37 @@ conda env create -f environment.yml
 
 Alternatively, you can install all Python packages manually with pip.
 
-In addition, the code expects a `.env` file to set the path to the proper data directory. This has to be created manually, and should contain:
+For R (version 4.5.1), the required packages can be installed as follows:
+
+```r
+install.packages(
+  "conflicted", "tidyverse", "lme4", "nlme",
+  "ggeffects", "ggpubr", "arrow", "haven",
+  "MuMIn", "rlang", "tableone", "r2mlm",
+  "reshape2", "gsignal"
+)
+```
+
+In addition, the Python and R code expect a `.env` file to set the paths to the proper directories on your machine. This has to be created manually, and should contain:
 
 ```
-DAT_DIR=/path/to/data/dir
+DAT_DIR=/path/to/data/directory
+MAN_IMG_DIR=/path/to/manuscript/images/directory
+SKIP_SRC_TRANSFER=TRUE
+SRC_DIR=/path/to/unprocessed/data/directory
+SRC_KP_FOLDER=keypress_folder
+SRC_ACC_FOLDER=accelerometer_folder
 ```
 
-## Code run-down
+DAT_DIR and MAN_IMG_DIR give the data and images directories, respectively. SKIP_SRC_TRANSFER is a parameter that is used for preprocessing. SRC_DIR gives the directory that contains the BiAffect data as pulled from our servers. SRC_KP_FOLDER and SRC_ACC_FOLDER give the names of the key press and accelerometer folders in SRC_DIR. In general, the code assumes directories to already exist. That might also apply to subdirectories that are not specified directly in the .env file but in the code.
+
+## BiAffect preprocessing
+
+For preprocessing of the CLEAR-3 BiAffect data, we used two of the scripts in the `src` directory, namely `preproc.R` and `preproc_all.R`, that preprocess the BiAffect data to produce key-press- and session-level data frames. `preproc_all.R` is a standalone script that will read its parameters from `.env` and then loop over all participants, preprocessing their data using the functions in `preproc.R`. `preproc.R` requires a tab-separated value file that contains the scale factor and PPI of every iPhone (which can be found [here](https://www.ios-resolution.com/)). This file should be placed in a `data` folder and be called `iPhone_screen_specs.tsv`.
+
+For preprocessing of author AL's data, which was collected using a newer version of BiAffect, we used slightly altered versions of the scripts described above. `src/preproc_alex.R` is the updated version of `src/preproc.R`, the functions of which are called from `preproc_alex.Rmd`.
+
+## GRSVD calculation
 
 - Most useful library functions are in `gsvd.py`. An example of how to use the functions can be found in `analyze_alex.ipynb`.
 - `gsvd.py` mostly consists of functions for data preparation. My entry point there is `get_typing_matrices`, which constructs day-by-hour matrices for every relevant BiAffect variable, for every participant. It does this by taking in keypress- and session-level data frames, ranking the dates within participants, filtering, and then constructing a long-format data frame that looks like this, with a hierarchical row index of (subject, dayNumber, hour):
@@ -81,6 +113,10 @@ dayNumber
 ```
 - Although `get_typing_matrices` heavily relies on the assumption that we want to aggregate our data to hours, `calculate_svd` is relatively time bin agnostic, in that it primarily looks at the data matrix shapes and does not care if the data has been aggregated into hours or, say, half hours. The most important thing is that the rows and columns are marked with integer indices, which is used during the construction of the connectivity graph to determine adjacency.
 
-## Regression
+## Sleep duration prediction
 
 The current Rmarkdown files do not contain the most up-to-date regressions.
+
+## Diurnal rhythm phase prediction
+
+Description to be added.
