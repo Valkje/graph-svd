@@ -1,3 +1,7 @@
+"""
+Python implementation of the graph-regularised non-negative matrix factorisation MATLAB code by Cai et al. (2011). Was not used in the manuscript.
+"""
+
 import numpy as np
 from numpy.linalg import multi_dot, norm
 from numpy.random import MT19937, Generator

@@ -202,7 +202,7 @@ def _pre_filter(df: pd.DataFrame, participant_mask: pd.Series | None = None):
 
     If `participant_mask` is not provided, a mask will be constructed from the following requirements:
     Participants should have, on average, 1) >= 20% of their daily hours filled with some data,
-    2) >= 50 key presses per hour, and 3) >= 9 days of data 
+    2) >= 50 key presses per hour, and 3) >= 7 days of data 
     (the first and last days will be dropped, resulting in at least a week of data).
 
     Parameters
@@ -243,7 +243,7 @@ def _pre_filter(df: pd.DataFrame, participant_mask: pd.Series | None = None):
 
         participant_mask = (avg_daily_activity >= 0.2) \
             & (avg_daily_amount >= 50) \
-            & (n_days >= 9) # First and last day will be dropped
+            & (n_days >= 7) # Was 9; First and last day were originally dropped
 
         participant_mask.name = 'mask'
 
@@ -289,7 +289,8 @@ def _get_days_to_remove(n_presses_df: pd.DataFrame):
 def _get_days_to_remove2(n_presses_df: pd.DataFrame):
     """
     Return an array of indices of days for which less than 33% of the hours
-    (i.e., fewer than eight hours) contains data.
+    (i.e., fewer than eight hours) contains data. Also remove first and last
+    days, as people will have switched BiAffect on/off on these days.
 
     Parameters
     ----------
@@ -303,7 +304,7 @@ def _get_days_to_remove2(n_presses_df: pd.DataFrame):
         Array of indices for the days that are to be excluded.
     """
     
-    n_presses_binary = n_presses_df > 0
+    n_presses_binary = n_presses_df >= 30
     # n_presses_nan = n_presses_df.where(n_presses_df > 0)
     
     perc_hours_active = n_presses_binary.mean(axis=1)
@@ -311,10 +312,15 @@ def _get_days_to_remove2(n_presses_df: pd.DataFrame):
 
     # Percentage is hard-coded for now
     day_mask: pd.Series = perc_hours_active >= 0.33
+
+    # Exclude first and last day
+    # day_mask.iloc[0] = False
+    # day_mask.iloc[-1] = False
     
     # dayNumber index is turned into a column
     day_mask_df = day_mask.reset_index(name='included')
 
+    # Get entries which are not included
     excluded_df = day_mask_df.loc[~day_mask_df['included']]
 
     return excluded_df.index.values
@@ -384,6 +390,9 @@ def get_typing_matrices(dat_kp: pd.DataFrame, dat_ses: pd.DataFrame):
     matrices: dict[str, dict[str, pd.DataFrame]]
         Two-level dictionary. First level is indexed by the subject ID, second level by the variable name.
         Contains the day-by-hour matrices as DataFrames.
+    dates: pd.DataFrame
+        Data frame giving the coupling between subject ID, date, and the day index (dayNumber) of the 
+        returned matrices.
     """
 
     group_by = ['subject', 'dayNumber', 'hour']
@@ -406,19 +415,20 @@ def get_typing_matrices(dat_kp: pd.DataFrame, dat_ses: pd.DataFrame):
     dat_kp_masked, participant_mask = _pre_filter(dat_kp_vars)
 
 
-    ses_variables = ['active', 'upright']
+    # ses_variables = ['active', 'upright']
+    ses_variables = ['active', 'upright', 'backspaceRate', 'autocorrectRate', 'madIKD']
 
     dat_ses_ranked = rank_dates(dat_ses)
-
+    
     dat_ses_ranked_g = dat_ses_ranked.groupby(by=group_by)
 
+    # Boolean columns might have the object dtype, so set numeric_only=False
     # Some accelerometer measurements are NaNs
-    dat_ses_vars = dat_ses_ranked_g[ses_variables].mean().fillna(0)
+    dat_ses_vars = dat_ses_ranked_g[ses_variables].mean(numeric_only=False).fillna(0)
 
     dat_ses_masked, _ = _pre_filter(dat_ses_vars, participant_mask)
-
-
     dat_masked = dat_kp_masked.join(dat_ses_masked, how='outer').fillna(0)
+    
     dats_dict = pivot_split(dat_masked, kp_variables + ses_variables)
 
 
@@ -638,7 +648,7 @@ def calculate_svd(
         Two-level dictionary with participant ID at the first level and modality name at the second level.
         Values should be day-by-hour DataFrames.
     modalities: str | list[str]
-        If a list of strings, will be used as a (non-strict) subset of the available data modalities in `typing_dfs` 
+        If a list of strings, will be used to subset the data modalities in `typing_dfs` 
         which will be used for the SVD. If 'all', will be used to select all of the available modalities.
     rank: int
         Rank of approximation.
@@ -718,7 +728,8 @@ def calculate_svd(
         # Get SVD matrix
         svd_mat_train = W_hat.reshape((-1, n_cols))
 
-        # Sometimes the matrix comes out all negative
+        # Sometimes the matrix comes out all negative. The sign of an SVD
+        # is arbitrary, so we can invert without a problem.
         if svd_mat_train.max() <= 0.00000001:
             svd_mat_train = svd_mat_train * -1
 
@@ -740,7 +751,163 @@ def calculate_svd(
         else:
             svd_mats[subject] = svd_mat_train
 
+        # Divide by n_cols to give row index where train-test split occurred
         split_indices[subject] = split_idx // n_cols
 
     return svd_mats, split_indices
 
+
+def calculate_permuted_svd(
+        n_permutations: int,
+        typing_dfs: dict[str, dict[str, pd.DataFrame]], 
+        modalities: str | list[str] = 'all',
+        rank: int = 1,
+        alpha: float = 1,
+        train_ratio: float = 1,
+        train_tail: bool = False
+    ) -> tuple[dict[str, np.ndarray] | dict[str, dict[str, np.ndarray | list[np.ndarray]]], dict[str, int]]:
+    """
+    Calculates a permuted graph-regularised SVD for different participants based on their hourly typing characteristics.
+    Was not used in manuscript.
+    
+    Parameters
+    ----------
+    typing_dfs: dict[str, dict[str, pd.DataFrame]]
+        Two-level dictionary with participant ID at the first level and modality name at the second level.
+        Values should be day-by-hour DataFrames.
+    modalities: str | list[str]
+        If a list of strings, will be used as a (non-strict) subset of the available data modalities in `typing_dfs` 
+        which will be used for the SVD. If 'all', will be used to select all of the available modalities.
+    rank: int
+        Rank of approximation.
+    alpha: float
+        Regularisation parameter. Higher values mean more regularisation.
+    train_ratio: float
+        Proportion of data (in the interval [0, 1]) that should be allocated to the training set. The remainder
+        will go to the test set. If no testing is to be performed, set to 1.
+    train_tail: bool
+        If the training data is taken from the first or last portion of the full data set.
+        
+    Returns
+    -------
+    svd_mats: dict[str, np.ndarray] | dict[str, dict[str, np.ndarray]]
+        The first component of the graph-regularised SVD, indexed by participant IDs (first level)
+        and potentially the 'train' and 'test' keys (second level).
+    split_indices: dict[str, int]
+        Day index where the train-test split occurred. Keys are the participant IDs.
+    """
+
+    # Seed origin: numpy.random.SeedSequence().entropy
+    rng = np.random.default_rng(seed=27440810091173614698991534913975660351)
+
+    svd_mats = dict()
+    split_indices = dict()
+
+    if modalities == 'all':
+        first_sub = next(iter(typing_dfs))
+        modalities = list(typing_dfs[first_sub].keys())
+        
+    n_modalities = len(modalities)
+
+    train_ratio = max(0, min(1, train_ratio))
+
+    for subject, dfs in tqdm(typing_dfs.items()):
+        # Subset the DataFrames to use, convert to flattened np.ndarray
+        # TODO: Check that all DataFrames have the same dimensionality
+        dfs_svd = {modality: dfs[modality] for modality in modalities}
+        dats_svd = {modality: df.to_numpy().flatten() for modality, df in dfs_svd.items()}
+
+        # Necessary to be able to split by data matrix row after flattening
+        n_cols = dfs_svd[modalities[0]].shape[1]
+        
+        # Transform to constrain range
+        if 'n_presses' in dats_svd:
+            dats_svd['n_presses'] = np.log1p(dats_svd['n_presses'])
+
+        # W is constructed by looking at the index values, 
+        # so actual data matrix values are irrelevant; just use the first matrix
+        # TODO: Optimize construction by splitting for test and train data
+        W_binary = construct_w_binary(dfs_svd[modalities[0]])
+
+        # Stack the data row vectors into a matrix
+        dat_svd = np.vstack(list(dats_svd.values()))
+
+        # Split data into training and testing set
+        n_nodes = dat_svd.shape[1]
+        if not train_tail:
+            split_idx = n_cols * int(n_nodes / n_cols * train_ratio)
+            dat_svd_train = dat_svd[:, :split_idx]
+            dat_svd_test = dat_svd[:, split_idx:] # Empty if train_ratio is too high
+            
+            lapl_train = csgraph.laplacian(W_binary[:split_idx, :split_idx])
+            lapl_test = csgraph.laplacian(W_binary[split_idx:, split_idx:])
+        else:
+            split_idx = n_cols * int(n_nodes / n_cols * (1 - train_ratio))
+            dat_svd_train = dat_svd[:, split_idx:]
+            dat_svd_test = dat_svd[:, :split_idx]
+            
+            lapl_train = csgraph.laplacian(W_binary[split_idx:, split_idx:])
+            lapl_test = csgraph.laplacian(W_binary[:split_idx, :split_idx])
+
+        if dat_svd_train.shape[1] == 0:
+            warnings.warn(f"No data in training set for participant {subject}")
+            continue
+
+        # Scale expects a matrix of (n_samples, n_features)
+        dat_svd_train = scale(dat_svd_train.T, with_mean=False).T
+
+        # Calculate SVD
+        U_tilde, W_hat = regularized_svd_chol(dat_svd_train, lapl_train, rank, alpha)
+        # Get SVD matrix
+        svd_mat_train = W_hat.reshape((-1, n_cols))
+
+        # Sometimes the matrix comes out all negative
+        if svd_mat_train.max() <= 0.00000001:
+            svd_mat_train = svd_mat_train * -1
+
+        # Check whether test set is not empty
+        if dat_svd_test.shape[1] > 0:
+            dat_svd_test = scale(dat_svd_test.T, with_mean=False).T
+
+            # Makes permutation more convenient
+            dat_svd_test = dat_svd_test.reshape((n_modalities, -1, n_cols))
+            n_rows = dat_svd_test.shape[1]
+            row_idxs = np.tile(np.atleast_2d(np.arange(n_rows)).T, (1, n_cols))
+            
+            test_mats = []
+            
+            for _ in range(n_permutations):
+                # Permute within rows (days)
+                # Every row is permuted differently, but consistent across modalities
+                # col_idxs permutation could look like this:
+                # [[0, 1, ..., 22, 23]      [[18, 12, ...,  6, 21]
+                #  [0, 1, ..., 22, 23]  -->  [ 9, 23, ..., 11,  1]
+                #  [0, 1, ..., 22, 23]]      [ 1, 21, ...,  7,  3]]
+                col_idxs = np.tile(np.arange(n_cols), (n_rows, 1))
+                col_idxs = rng.permuted(col_idxs, axis=1)
+                dat_svd_test_perm = dat_svd_test[:, row_idxs, col_idxs]
+
+                # Flatten 
+                dat_svd_test_perm = dat_svd_test_perm.reshape((n_modalities, -1))
+                
+                # Calculate SVD for test cases
+                W_hat_test = regularized_svd_test(dat_svd_test_perm, lapl_test, alpha, U_tilde)
+                svd_mat_test = W_hat_test.reshape((-1, n_cols))
+    
+                if svd_mat_test.max() <= 0.00000001:
+                    svd_mat_test = svd_mat_test * -1
+
+                test_mats.append(svd_mat_test)
+
+            svd_mats[subject] = {
+                'train': svd_mat_train,
+                'tests': test_mats
+            }
+        else:
+            svd_mats[subject] = svd_mat_train
+
+        split_indices[subject] = split_idx // n_cols
+
+        break 
+
+    return svd_mats, split_indices
