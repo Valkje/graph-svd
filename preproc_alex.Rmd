@@ -1,0 +1,122 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(arrow)
+library(tidyverse)
+
+source("preproc_alex.R")
+
+readRenviron(".env")
+
+# Points to Alex' folder
+dat_dir <- Sys.getenv("DAT_DIR")
+```
+
+```{r}
+raw_kp <- read_parquet(file.path(dat_dir, "raw_kp_pull_2025-02-21.parquet"))
+raw_acc <- read_parquet(file.path(dat_dir, "raw_acc_pull_2025-02-21.parquet"))
+
+raw_kp
+```
+
+```{r}
+tmp <- raw_kp[1:1000,]
+
+ggplot(tmp, aes(keypress_timestamp, duration)) +
+  geom_point()
+```
+
+```{r}
+as_datetime(raw_kp$session_timestamp[1], tz="UTC")
+```
+
+```{r}
+offset_comps <- str_match("-07:00", "([+-])(\\d+):(\\d+)")[,2:4]
+hours(paste(offset_comps[1:2], collapse = ""))
+```
+
+```{r}
+dat_acc <- preproc_acc(raw_acc)
+
+ls <- preproc_kp(raw_kp, dat_acc)
+dat_kp <- ls$dat_kp
+dat_ses <- ls$dat_ses
+```
+
+```{r}
+dplyr::last_dplyr_warnings()
+```
+
+
+```{r}
+Sys.setenv(TZ="UTC")
+dat_ses
+```
+
+```{r}
+hist(hour(dat_ses$session_timestamp_local))
+hist(hour(dat_ses$session_timestamp))
+```
+
+```{r}
+# Change since 2025-02-21: Now also has local timestamps
+write_parquet(dat_acc, file.path(dat_dir, "dat_acc_alex_pull_2025-07-31.parquet"))
+write_parquet(dat_kp, file.path(dat_dir, "dat_kp_alex_pull_2025-07-31.parquet"))
+write_parquet(dat_ses, file.path(dat_dir, "dat_ses_alex_pull_2025-07-31.parquet"))
+```
+
+# Explore data
+
+```{r}
+dat_ses <- read_parquet(file.path(dat_dir, "dat_ses_alex.parquet"))
+```
+
+```{r}
+dat_ses_15 <- dat_ses %>%
+  filter(phoneType == "iPhone 15")
+
+dat_ses_15
+```
+
+```{r}
+dat_hour <- dat_ses_15 %>%
+  group_by(date, hour) %>%
+  summarize(
+    medianIKD = mean(medianIKD),
+    totalKeyPresses = sum(totalKeyPresses),
+    timezone = timezone[1]
+  ) %>%
+  mutate(medianIKD = na_if(medianIKD, 0))
+
+dat_hour
+```
+
+```{r}
+dat_hour %>%
+  group_by(date) %>%
+  summarize(timezone = last(timezone)) %>%
+  filter(timezone != lag(timezone)) %>% # Current tz not equal to previous tz
+  mutate(
+    last_date = lead(date) - days(1),
+    utc_offset = as.integer(str_extract(timezone, "([+-]\\d+):\\d+", group = 1)),
+    night_start = (23 + utc_offset) %% 24,
+    night_end = (7 + utc_offset) %% 24
+    # TODO: Think about when night_end < night_start, i.e. when we need to night patches
+  )
+```
+
+
+```{r fig.height=10}
+ggplot(dat_hour, aes(hour, date)) +
+  geom_point(aes(size = log(totalKeyPresses), color = timezone)) +
+  scale_y_continuous(
+    trans = c("date", "reverse")
+  ) +
+  theme(text = element_text(size = 18))
+
+ggsave("bubbles.pdf")
+```
+
