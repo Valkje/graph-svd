@@ -48,10 +48,13 @@ For preprocessing of the CLEAR-3 BiAffect data, we used two of the scripts in th
 
 For preprocessing of author AL's data, which was collected using a newer version of BiAffect, we used slightly altered versions of the scripts described above. `src/preproc_alex.R` is the updated version of `src/preproc.R`, the functions of which are called from `preproc_alex.Rmd`.
 
-## GRSVD calculation
+## GRSVD preparation and calculation
 
-- Most useful library functions are in `gsvd.py`. An example of how to use the functions can be found in `analyze_alex.ipynb`.
-- `gsvd.py` mostly consists of functions for data preparation. My entry point there is `get_typing_matrices`, which constructs day-by-hour matrices for every relevant BiAffect variable, for every participant. It does this by taking in keypress- and session-level data frames, ranking the dates within participants, filtering, and then constructing a long-format data frame that looks like this, with a hierarchical row index of (subject, dayNumber, hour):
+Most useful library functions are in `gsvd.py`. An example of how to use the functions can be found in `analyze_alex.ipynb`.
+
+### Data aggregation
+
+`gsvd.py` mostly consists of functions for data preparation. The entry point is `get_typing_matrices`, which constructs day-by-hour matrices for every relevant BiAffect variable, for every participant. It does this by taking in keypress- and session-level data frames, ranking the dates within participants, filtering, and then constructing a long-format data frame that looks like this, with a hierarchical row index of (subject, dayNumber, hour):
 ```
                              IKD  n_presses    active  upright
 subject dayNumber hour                                        
@@ -67,7 +70,8 @@ alex    0         19    0.182817        771  0.066667      1.0
                   21    0.198719        154  0.000000      1.0
                   22    0.182370        158  0.500000      1.0
 ```
-- Within `get_typing_matrices`, `pivot_split` then takes this data frame and pivots every variable column into a day-by-hour matrix, resulting in a hierarchical column index of (variable, hour):
+
+Within `get_typing_matrices`, `pivot_split` then takes this data frame and pivots every variable column into a day-by-hour matrix, resulting in a hierarchical column index of (variable, hour):
 ```
                         IKD                                                    
 hour                     0         1         2         3         4         5    
@@ -84,7 +88,8 @@ alex    0          0.000000  0.000000  0.000000  0.000000  0.000000  0.000000
         343        0.000000  0.199515  0.000000  0.000000  0.000000  0.000000   
         344        0.000000  0.174891  0.000000  0.000000  0.000000  0.000000   
 ```
-- After this, the entire data frame is split into separate matrices based on subject and variable, resulting in a two-level dictionary with participant as the first index and variable as the second index:
+
+After this, the entire data frame is split into separate matrices based on subject and variable, resulting in a two-level dictionary with participant as the first index and variable as the second index:
 ```
 {'alex': {'IKD': 
 hour             0         1         2         3         4         5       6   
@@ -102,7 +107,10 @@ dayNumber
 344        0.000000  0.174891  0.000000  0.000000  0.000000  0.000000  0.0000      ,
 ...
 ```
-- After data preparation, the two-level dictionary from `get_typing_matrices` can be passed to `calculate_svd`, which loops over all participants, constructs a time connectivity graph based on the row and column indices of their matrices, and calculates the graph-regularised SVD. It supports train/test splits, but by default uses all data for training (the difference has never been huge because we only used four data modalities for BiAffect, which results in a small number of parameters). With train/test splits, the output is a two-level dictionary (one-level without train/test splits) of numpy arrays, with the first index being the participant, and the second being `'train'` or `'test'`:
+
+### GRSVD calculation
+
+After data preparation, the two-level dictionary from `get_typing_matrices` can be passed to `calculate_svd`, which loops over all participants, constructs a time connectivity graph based on the row and column indices of their matrices, and calculates the graph-regularised SVD. It supports train/test splits, but by default uses all data for training (the difference has never been huge because we only used four data modalities for BiAffect, which results in a small number of parameters). With train/test splits, the output is a two-level dictionary (one-level without train/test splits) of numpy arrays, with the first index being the participant, and the second being `'train'` or `'test'`:
 ```
 {'alex': {'train': array([[1.36293734, 1.63534636, 1.70035293, 1.00559802, 0.71495363,
           1.00167044, 0.3900861 , 0.18152092, 0.12258938, 0.13548369,
@@ -111,12 +119,13 @@ dayNumber
           1.41246628, 1.22464226, 1.52615389, 2.48503361],
 ...
 ```
-- Although `get_typing_matrices` heavily relies on the assumption that we want to aggregate our data to hours, `calculate_svd` is relatively time bin agnostic, in that it primarily looks at the data matrix shapes and does not care if the data has been aggregated into hours or, say, half hours. The most important thing is that the rows and columns are marked with integer indices, which is used during the construction of the connectivity graph to determine adjacency.
+
+Although `get_typing_matrices` heavily relies on the assumption that we want to aggregate our data to hours, `calculate_svd` is relatively time bin agnostic, in that it primarily looks at the data matrix shapes and does not care if the data has been aggregated into hours or, say, half hours. The most important thing is that the rows and columns are marked with integer indices, which is used during the construction of the connectivity graph to determine adjacency.
 
 ## Sleep duration prediction
 
-The current Rmarkdown files do not contain the most up-to-date regressions.
+Sleep duration prediction is done in `regress_sleep.Rmd`. Broadly speaking, this notebook 1) reads demographics and Oura ring data, as well as the GRSVD values calculated in the previous step, 2) transforms, merges, and selects data to be entered into the regressions, 3) runs, evaluates, and plots several linear mixed-effect regressions, and 4) does some miscellaneous sensitivity analyses. More information can be found in the notebook itself.
 
-## Diurnal rhythm phase prediction
+## Diurnal rhythm phase extraction
 
 Description to be added.
