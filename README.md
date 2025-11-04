@@ -126,6 +126,8 @@ Although `get_typing_matrices` heavily relies on the assumption that we want to 
 
 Sleep duration prediction is done in `regress_sleep.Rmd`. Broadly speaking, this notebook 1) reads demographics and Oura ring data, as well as the GRSVD values calculated in the previous step, 2) transforms, merges, and selects data to be entered into the regressions, 3) runs, evaluates, and plots several linear mixed-effect regressions, and 4) does some miscellaneous sensitivity analyses. More information can be found in the notebook itself.
 
+To view the results without running the notebook yourself, you can download `regress_sleep.html` and open it with your browser. Note that some chunk outputs have been erased to avoid exposing participant data to the internet, but all code, regression results, and plots are still available.
+
 ## Diurnal rhythm phase extraction
 
 Description to be added.
