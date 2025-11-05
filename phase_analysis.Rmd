@@ -1,0 +1,696 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+    df_print: paged
+    toc_float: yes
+    theme: spacelab
+  pdf_document:
+    toc: yes
+---
+
+This notebook calculates the rhythm phase of someone's smartphone typing activity, which is a metric that indicates when they were most active (w.r.t. UTC+00:00). 
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(arrow)
+library(ggpubr)
+
+readRenviron(".env")
+
+dat_dir <- Sys.getenv("DAT_DIR") # Data directory
+man_img_dir <- Sys.getenv("MAN_IMG_DIR") # Manuscript image directory
+
+source("utils.R")
+
+# Otherwise hour and date extraction use local time
+Sys.setenv(TZ='UTC')
+```
+
+# BiAffect and time zones
+
+Read the key press data, which contains information about time zones. This forms the basis for finding the time zone transitions that we need for our analysis.
+
+```{r load-dat-kp, results='hide'}
+dat_kp <- read_parquet(file.path(dat_dir, 
+                                 "CLEAR3_processed_2024-10-24", 
+                                 "dat_kp.parquet"))
+
+dat_kp
+```
+
+```{r results='hide'}
+dat_kp_transition <- dat_kp %>%
+  group_by(subject) %>%
+  mutate(
+    prev_timezone = dplyr::lag(timezone)
+  ) %>%
+  filter(timezone != prev_timezone) %>%
+  mutate(
+    keypressTimestampUTC = keypressTimestampLocal - hours(timezone / 100),
+    roundedTimestampUTC = round_date(keypressTimestampUTC, unit = "hour"),
+    date = date(keypressTimestampUTC),
+    days_to_next_transition = lead(date) - date,
+    diff_tz = (timezone - prev_timezone) / 100
+  ) %>%
+  ungroup() %>%
+  select(
+    subject, timezone, prev_timezone, sessionTimestampLocal, keypressTimestampLocal,
+    keypressTimestampUTC, roundedTimestampUTC, date, days_to_next_transition,
+    diff_tz
+  )
+
+dat_kp_transition
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(dat_kp_transition, file.path(
+  dat_dir, "CLEAR3_processed_2024-10-24", "dat_kp_transition.rds"
+))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+dat_kp_transition <- readRDS(file.path(
+  dat_dir, "CLEAR3_processed_2024-10-24", "dat_kp_transition.rds"
+))
+```
+
+118 transitions are in effect for at least 7 days
+94 transitions show an NA, meaning we don't know how long they lasted
+212 in total
+
+# Phase analysis
+
+The phase analysis proceeds in several steps:
+
+1. Read data
+2. Find time zone transitions for which participants remain in the new time zone for at least seven days
+3. Find the baseline period leading up to a transition
+4. Calculate all phases and centre them based on the average phase found in the baseline period
+5. Test for a difference between phases of West- and Eastwards travel
+
+```{r results='hide'}
+svd_phase_df <- read_parquet(file.path(
+    dat_dir, 
+    # I want as much data as possible, even if it is lower quality
+    # "svd_mats_long_alpha1_2025-07-30_utc-reference_min30.parquet"
+    "svd_mats_long_alpha1_2025-07-30_utc-reference.parquet" 
+  )) %>%
+  relocate(subject, .before = 1) %>%
+  mutate(
+    hour = hour(timestamp),
+    date = date(timestamp)
+  ) 
+
+svd_transitions <- svd_phase_df %>%
+  inner_join(dat_kp_transition, 
+             by = c("subject", "timestamp" = "roundedTimestampUTC")) %>%
+  mutate(trip_id = 1:n()) %>%
+  rename(date = date.x)
+
+svd_transitions
+```
+
+```{r results='hide'}
+trip_starts_df <- svd_transitions %>%
+  filter(days_to_next_transition >= 7) %>%
+  select(subject, timestamp, date, trip_id, days_to_next_transition, diff_tz, prev_timezone) %>%
+  rename(trip_date = date)
+
+trip_starts_df
+```
+
+Join the start of every trip that is at least 7 days long to the full GRSVD data frame. Propagate the trip information (ID, start date, etc.) within days first because a transition usually takes place somewhere in the middle of a day. Then propagate the trip information down, within participants. This might spill over into other trips, but we only select the first 7 days of the trips we joined into the data frame, and we know they are at least that long.
+
+```{r results='hide'}
+trip_df <- svd_phase_df %>%
+  full_join(trip_starts_df, by = c("subject", "timestamp")) %>%
+  arrange(subject, timestamp) %>%
+  group_by(subject, date) %>% # First propagate within days
+  fill(trip_id, trip_date, diff_tz, prev_timezone, .direction = "downup") %>%
+  group_by(subject) %>% # Then propagate within participants
+  # ID might leak into other trips, so select only first 7 days
+  fill(trip_id, trip_date, diff_tz, prev_timezone, .direction = "down") %>%
+  group_by(subject, trip_id) %>%
+  mutate(
+    days_since_start = date - trip_date,
+    period = "transition"
+  ) %>%
+  filter(days_since_start <= 7) %>%
+  ungroup()
+
+trip_df
+```
+
+Find the baseline period leading up to a transition. Note that this might be part of a previous trip, even the 7-day period we selected above.
+
+Also find the time corresponding to the average phase per baseline period. We can use that to centre all baseline phases on zero.
+
+```{r results='hide'}
+baseline_df <- svd_phase_df %>%
+  full_join(trip_starts_df, by = c("subject", "timestamp")) %>%
+  arrange(subject, timestamp) %>%
+  group_by(subject) %>% # Then propagate within participants
+  # ID might leak into other trips, so select only first 7 days
+  fill(trip_id, trip_date, diff_tz, prev_timezone, .direction = "up") %>%
+  group_by(subject, trip_id) %>%
+  mutate(
+    days_since_start = date - trip_date,
+    period = "baseline",
+  ) %>%
+  filter(days_since_start >= -3, days_since_start < 0)
+
+baseline_df
+```
+
+Calculate phase and hour offsets from the baseline periods
+
+```{r results='hide'}
+baseline_offsets <- baseline_df %>%
+  mutate(
+    theta = hour / 24 * 2 * pi,
+    x = svd_value * cos(theta),
+    y = svd_value * sin(theta)
+  ) %>%
+  group_by(subject, trip_id, date) %>%
+  summarize(
+    x_mean = mean(x),
+    y_mean = mean(y),
+    phase = atan2(y_mean, x_mean)
+  ) %>%
+  group_by(subject, trip_id) %>%
+  summarize(
+    phase_mean = atan2(sum(sin(phase)), sum(cos(phase))),
+    hour = phase_mean / (2 * pi) * 24
+  ) %>%
+  rename(phase_offset = phase_mean, hour_offset = hour)
+
+baseline_offsets
+```
+
+Important: Contains duplicate subject-date combinations, which are differentiated by trip_id!
+
+```{r results='hide'}
+trip_bl_df <- trip_df %>%
+  bind_rows(baseline_df) %>%
+  arrange(subject, trip_id, timestamp) %>%
+  left_join(baseline_offsets, by = c("subject", "trip_id"))
+
+trip_bl_df
+```
+
+Extract phase, subtracting the hour offset from every hour before calculation
+
+```{r results='hide'}
+phase_df <- trip_bl_df %>%
+  mutate(
+    theta = hour / 24 * 2 * pi,
+    # theta_local = (hour + prev_timezone / 100 + 6) %% 24 / 24 * 2 * pi,
+    theta_offset = (hour - hour_offset) / 24 * 2 * pi,
+    x = svd_value * cos(theta_offset),
+    y = svd_value * sin(theta_offset)
+  ) %>%
+  group_by(subject, trip_id, date) %>%
+  summarize(
+    x_mean = mean(x),
+    y_mean = mean(y),
+    phase = atan2(y_mean, x_mean),
+    phase_offset = phase_offset[1],
+    radius = sqrt(x_mean^2 + y_mean^2),
+    days_since_start = days_since_start[1],
+    diff_tz = diff_tz[1],
+    period = period[1]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    diff_sign = factor(sign(diff_tz), levels = c(-1, 1), labels = c("Westwards", "Eastwards")),
+    days_since_start = as.numeric(days_since_start)
+  ) # %>%
+  # filter(abs(diff_tz) >= 2)
+
+phase_df
+```
+
+```{r eval=FALSE, include=FALSE}
+phase_df %>%
+  drop_na(x_mean) %>%
+  pull(subject) %>%
+  unique() %>%
+  as.integer() %>%
+  saveRDS(file.path(dat_dir, "ids_phase_analysis.rds"))
+```
+
+Calculate some summary metrics
+
+```{r}
+phase_summ_df <- phase_df %>%
+  drop_na(phase) %>%
+  group_by(diff_sign, days_since_start) %>%
+  summarize(
+    phase_mean = mean(phase),
+    phase_sd = sd(phase),
+    phase_se = phase_sd / sqrt(n())
+  )
+
+phase_summ_df
+```
+
+Testing t-test assumptions; variances not really equal, normality not great for all cases. I'll use Welch's t-test, which does not assume equal variances and is somewhat robust to skewed distributions.
+
+```{r fig.height=8, fig.width=15}
+phase_df %>%
+  group_by(days_since_start, diff_sign) %>%
+  summarize(
+    phase_var = var(phase, na.rm = TRUE)
+  )
+
+ggplot(phase_df, aes(sample = phase)) +
+  geom_qq() +
+  geom_qq_line() +
+  facet_grid(cols = vars(days_since_start), rows = vars(diff_sign), scales = "free") +
+  theme(text = element_text(size = 18))
+```
+
+Run Welch's t-tests using a function from `utils.R`
+
+```{r}
+welch_df <- welch_tests(phase_df)
+
+welch_df
+```
+
+Repeat the Welch's tests, but only for transitions with at least 2 hours between time zones
+
+```{r}
+phase_df_2 <- phase_df %>%
+  filter(abs(diff_tz) >= 2) %>%
+  add_column(included = "diff_tz_2")
+
+welch_df_2 <- welch_tests(phase_df_2) %>%
+  add_column(included = "diff_tz_2")
+```
+
+```{r eval=FALSE, include=FALSE}
+format_welch(welch_df) %>%
+  write_csv(file.path(man_img_dir, "welch_all_stats.csv"))
+
+format_welch(welch_df_2) %>%
+  write_csv(file.path(man_img_dir, "welch_ge2_stats.csv"))
+```
+
+33 participants in `phase_df`.
+
+```{r}
+n_distinct(drop_na(phase_df, phase)$subject)
+```
+
+Plot the phase results
+
+```{r fig.height=3.5, fig.width=8.2}
+gl <- guide_legend(title = NULL, position = "inside")
+
+tmp_phase <- phase_df %>%
+  add_column(included = "all") %>%
+  bind_rows(phase_df_2)
+
+tmp_welch <- welch_df %>%
+  add_column(included = "all") %>%
+  bind_rows(welch_df_2) %>%
+  filter(p_value < 0.05)
+
+ggplot(tmp_phase, aes(as.factor(days_since_start), phase)) +
+  annotate("rect", xmin = 0, xmax = 3.5, ymin = -1.5*pi, ymax = 1.5*pi, alpha = 0.3) +
+  annotate("rect", xmin = 0, xmax = 3.5, ymin = pi-0.3, ymax = 1.5*pi, alpha = 0.3) +
+  geom_point(aes(color = diff_sign)) + # Define x scale data type before text annotation
+  annotate("text", x = 1.95, y = pi, label = "Pre-transition") +
+  # geom_line(aes(group = trip_id, color = diff_sign), alpha = 0.2) +
+  geom_boxplot(aes(fill = diff_sign), outlier.shape = NA) +
+  geom_bracket(
+    aes(
+      xmin = days_since_start + 3.8, 
+      xmax = days_since_start + 4.2, 
+      label = stars
+    ), 
+    y.position = pi - 0.2,
+    tip.length = 0.01,
+    size = 1,
+    label.size = 5,
+    data = tmp_welch
+  ) +
+  scale_y_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π")
+  ) +
+  scale_fill_manual(values = c("cadetblue3", "coral2")) +
+  scale_color_manual(values = c("cadetblue3", "coral2")) +
+  coord_cartesian(xlim = c(1, 11), ylim = c(-pi, pi), clip = "on") +
+  labs(x = "Days since transition start", y = "Phase (centred on pre-transition period)") +
+  facet_wrap(~ included, 
+             labeller = as_labeller(c(
+               "all" = "All transitions", 
+               "diff_tz_2" =  "Transitions with ≥2 hours difference"
+             ))) +
+  guides(fill = gl, color = gl) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12), 
+    panel.background = element_rect(fill = "white", color = "grey"),
+    legend.position = c(0.92, 0.13),
+    legend.background = element_rect(fill = alpha("grey", 0.4), color = NA)
+  )
+
+# ggsave(
+#   file.path("~/Documents/Presentations/SIN meetings/Present/Sleep and travel/phase_clear3.png"),
+#   dpi = 300
+# )
+
+# ggsave(file.path(man_img_dir, "alex_phase_analysis", "phase_clear3.pdf"),
+#        device = cairo_pdf)
+```
+
+A simple line plot of the mean phases, not included in the manuscript
+
+```{r}
+ggplot(phase_summ_df, aes(days_since_start, phase_mean)) +
+  geom_line(aes(color = diff_sign)) +
+  geom_ribbon(aes(ymin = phase_mean - phase_se, ymax = phase_mean + phase_se, fill = diff_sign),
+              alpha = 0.5) +
+  scale_y_continuous(
+    breaks = c(-pi/2, -pi/4, 0, pi/4, pi/2),
+    labels = c("-π/2", "-π/4", "0", "π/4", "π/2")
+  )
+```
+
+A miscellaneous polar plot.
+
+```{r}
+tmp <- svd_phase_df %>%
+  filter(subject == "3009", date == "2021-01-15") %>%
+  mutate(
+    theta = hour / 24 * 2 * pi,
+    hour_local = (hour - 6) %% 24, # Pretend local time zone is UTC-06:00
+    theta_local = hour_local / 24 * 2 * pi
+  )
+
+ggplot(tmp, aes(x = theta, y = svd_value)) +
+  geom_col() +
+  scale_x_continuous(breaks = c(0, pi/2, pi, 3*pi/2), 
+                     labels = c("00:00", "06:00", "12:00", "18:00")) +
+  coord_polar(theta = "x")
+
+ggplot(tmp, aes(x = theta_local, y = svd_value)) +
+  geom_col() +
+  scale_x_continuous(breaks = c(0, pi/2, pi, 3*pi/2), 
+                     labels = c("00:00", "06:00", "12:00", "18:00")) +
+  coord_polar(theta = "x")
+```
+
+## 2nd review analyses
+
+Couple time zones to SVD values:
+
+```{r}
+svd_tz_df <- svd_phase_df %>%
+  full_join(dat_kp_transition, 
+             by = c("subject", "timestamp" = "roundedTimestampUTC")) %>%
+  rename(date = date.x) %>%
+  # Shift prev_timezone upwards, then merge with timezone
+  mutate(
+    tz = lead(prev_timezone),
+    tz = case_when(
+      !is.na(tz) ~ tz,
+      !is.na(timezone) ~ timezone,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  group_by(subject) %>%
+  fill(tz, .direction = "updown") %>%
+  select(-c(timezone, prev_timezone, sessionTimestampLocal:diff_tz)) %>%
+  rename(timezone = tz) %>%
+  ungroup()
+
+svd_tz_df
+```
+
+```{r}
+svd_phase_tz <- svd_tz_df %>%
+  mutate(
+    theta = hour / 24 * 2 * pi,
+    x = svd_value * cos(theta),
+    y = svd_value * sin(theta)
+  ) %>%
+  group_by(subject, date) %>%
+  summarize(
+    x_mean = mean(x),
+    y_mean = mean(y),
+    phase = atan2(y_mean, x_mean),
+    radius = sqrt(x_mean^2 + y_mean^2),
+    timezone = timezone[1]
+  ) %>%
+  drop_na(phase, timezone) %>%
+  group_by(timezone) %>%
+  mutate(
+    n_tz_obs = n(),
+    tz_numeric = timezone,
+    timezone = sprintf("UTC%+03d:00", timezone / 100),
+    timezone = fct_reorder(timezone, tz_numeric, .fun = first),
+    tz_obs_label = str_glue("{timezone}, n = {n_tz_obs}"),
+    tz_obs_label = fct_reorder(tz_obs_label, tz_numeric, .fun = first)
+  ) %>%
+  ungroup()
+
+svd_phase_tz
+```
+
+```{r fig.height=8}
+ggplot(svd_phase_tz, aes(phase)) +
+  geom_density(aes(fill = timezone), position = "identity", alpha = 0.5)
+
+ggplot(svd_phase_tz, aes(phase)) +
+  geom_histogram(aes(fill = timezone), position = "identity", alpha = 0.5) +
+  scale_x_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π")
+  ) +
+  labs(x = "Phase", y = "Count", fill = "Time zone")
+
+g_phase_violin_clear3 <- ggplot(svd_phase_tz, aes(timezone, phase)) +
+  geom_violin(aes(fill = tz_obs_label)) +
+  geom_point(alpha = 0.1) +
+  scale_y_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π"),
+    limits = c(-pi, pi)
+  ) +
+  labs(x = "Time zone", y = "Phase", fill = "Time zone", 
+       title = bquote(bold("A") ~ "CLEAR-3 phases")) +
+  theme(text = element_text(size = 18))
+
+g_phase_violin_clear3
+```
+
+NOTE: Alex's phase plot can be generated in visualize_alex.Rmd.
+
+```{r fig.height=8, eval=FALSE}
+ggarrange(g_phase_violin_clear3, g_phase_violin_alex, ncol = 1)
+
+ggsave(file.path(man_img_dir, "phase_by_tz.png"), dpi = 300)
+```
+
+
+### Recovery analysis
+
+A recovery analysis, as suggested by the reviewers, examines how long it takes for a participant to reach their phase equilibrium after transitioning to a new time zone. It would be similar in spirit to Willoughby et al, examining deviation from baseline (which is important, as every participant has their own baseline). A time zone transition would then elicit a deflection from baseline, and recovery would be marked by a return to that baseline. The code below was an initial attempt to do such an analysis, but we do not have sufficient data to check that it works. Use at your own risk, but if it inspires you to do a similar analysis, please credit Willoughby and colleagues as well as ourselves.
+
+This calculates how many successive days each participant spent in a specific time zone. (If they return to a previously visited time zone, that will result in two separate entries for that time zone.)
+
+```{r results='hide'}
+dat_kp_tz_dwelling <- dat_kp %>%
+  group_by(subject) %>%
+  # We need time zones to calculate UTC time and make the filtering work
+  # correctly (is.na(prev_timezone looks for a participant's first row))
+  drop_na(timezone) %>%
+  mutate(
+    prev_timezone = dplyr::lag(timezone),
+    keypressTimestampUTC = keypressTimestampLocal - hours(timezone / 100),
+    roundedTimestampUTC = round_date(keypressTimestampUTC, unit = "hour"),
+    date = date(keypressTimestampUTC),
+    last_date = last(date)
+  ) %>%
+  filter(is.na(prev_timezone) | timezone != prev_timezone) %>%
+  mutate(
+    days_to_next_transition = case_when(
+      is.na(lead(date)) ~ last_date - date, 
+      TRUE ~ lead(date) - date
+    ),
+    diff_tz = (timezone - prev_timezone) / 100
+  ) %>%
+  ungroup() %>%
+  select(
+    subject, timezone, prev_timezone, sessionTimestampLocal, keypressTimestampLocal,
+    keypressTimestampUTC, roundedTimestampUTC, date, days_to_next_transition,
+    diff_tz
+  ) %>%
+  relocate(prev_timezone, .before = timezone)
+
+dat_kp_tz_dwelling
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(dat_kp_tz_dwelling, file.path(
+  dat_dir, "CLEAR3_processed_2024-10-24", "dat_kp_tz_dwelling.rds"
+))
+```
+
+```{r eval=FALSE, include=FALSE}
+dat_kp_tz_dwelling <- readRDS(file.path(
+  dat_dir, "CLEAR3_processed_2024-10-24", "dat_kp_tz_dwelling.rds"
+))
+```
+
+I want at least seven days of from which we can estimate someone's baseline, which is at least a week removed from a time zone transition (i.e., a week's buffer on either side). This means I require participants to spend at least 3*7 = 21 days in a time zone.
+
+```{r results='hide'}
+eligible_dwellings <- dat_kp_tz_dwelling %>%
+  group_by(subject) %>%
+  filter(
+    days_to_next_transition == max(days_to_next_transition), 
+    days_to_next_transition >= 21
+  )
+
+eligible_dwellings
+```
+
+Use eligible_dwellings to select the right rows from the SVD data frame. TODO: Check that I am doing the phase baseline calculation correctly, especially if it needs to be referenced to local time.
+
+```{r results='hide'}
+# Dots define which variables to group by (participant, date, etc.)
+calculate_phase <- function(df, angle, magnitude, ...) {
+  df %>%
+    mutate(
+      theta = {{angle}} / 24 * 2 * pi,
+      x = {{magnitude}} * cos(theta),
+      y = {{magnitude}} * sin(theta)
+    ) %>%
+    group_by(...) %>%
+    summarize(
+      x_mean = mean(x),
+      y_mean = mean(y),
+      phase = atan2(y_mean, x_mean)
+    )
+}
+
+bl_phase_df <- svd_phase_df %>%
+  full_join(eligible_dwellings, by = c("subject", "timestamp" = "roundedTimestampUTC")) %>%
+  # The timestamp rounding might introduce a mismatch between date.y and
+  # roundedTimestampUTC. Merging on date would introduce extra rows, which I'd
+  # rather avoid
+  select(-c(date.y, sessionTimestampLocal, keypressTimestampLocal, keypressTimestampUTC)) %>%
+  rename(date = date.x) %>%
+  group_by(subject) %>%
+  mutate(transition_date = if_else(!is.na(timezone), date, NA)) %>%
+  fill(prev_timezone:transition_date, .direction = "downup") %>%
+  filter(
+    date >= transition_date + days(7), 
+    date <= transition_date + days_to_next_transition - days(7)
+  ) %>%
+  mutate(
+    timestamp_local = timestamp + hours(timezone / 100),
+    date_local = as_date(timestamp_local)
+  ) %>%
+  calculate_phase(hour(timestamp_local), svd_value, subject, date_local) %>%
+  group_by(subject) %>%
+  summarize(
+    mean_bl_phase = mean(phase),
+    n_days = n()
+  ) %>%
+  # Exclude baseline estimates consisting of less than seven days
+  filter(n_days >= 7)
+
+bl_phase_df
+```
+
+Calculate phase in time zone transitions w.r.t. local time (use code from visualize_alex.Rmd)
+
+```{r results='hide'}
+trip_local <- trip_bl_df %>%
+  left_join(bl_phase_df, by = "subject") %>%
+  mutate(
+    timezone = ifelse(days_since_start < 0, prev_timezone, prev_timezone + diff_tz * 100),
+    timestamp_local = timestamp + hours(timezone / 100),
+    date_local = as_date(timestamp_local),
+    theta_local = hour(timestamp_local) / 24 * 2 * pi,
+    x_local = svd_value * cos(theta_local),
+    y_local = svd_value * sin(theta_local),
+    diff_sign = factor(sign(diff_tz))
+  ) %>%
+  group_by(subject, date_local) %>%
+  # The time zone shift can result in incomplete days, which skew the phase
+  filter(n() == 24, abs(diff_tz) > 1) %>%
+  summarize(
+    x_mean_local = mean(x_local),
+    y_mean_local = mean(y_local),
+    mean_bl_phase = mean_bl_phase[1],
+    phase_local = atan2(y_mean_local, x_mean_local),
+    phase_local_bl = ((phase_local - mean_bl_phase) + pi) %% (2*pi) - pi,
+    radius_local = sqrt(x_mean_local^2 + y_mean_local^2),
+    timezone = timezone[1],
+    diff_sign = diff_sign[1],
+    diff_tz = diff_tz[1],
+    days_since_start = days_since_start[1],
+    period = period[1]
+  ) %>%
+  # I was not able to calculate a baseline phase for all participants
+  drop_na(phase_local_bl) %>%
+  ungroup()
+
+trip_local
+```
+
+The baseline offset has been calculated based on UTC time.
+
+```{r}
+gl <- guide_legend(title = NULL, position = "inside")
+
+ggplot(trip_local, aes(as.factor(days_since_start), phase_local_bl)) +
+  annotate("rect", xmin = 0, xmax = 2.5, ymin = -1.5*pi, ymax = 1.5*pi, alpha = 0.3) +
+  annotate("rect", xmin = 0, xmax = 2.5, ymin = pi-0.3, ymax = 1.5*pi, alpha = 0.3) +
+  geom_point(aes(color = diff_sign)) + # Define x scale data type before text annotation
+  annotate("text", x = 1.45, y = pi, label = "Pre-transition") +
+  # geom_line(aes(group = trip_id, color = diff_sign), alpha = 0.2) +
+  geom_boxplot(aes(fill = diff_sign), outlier.shape = NA) +
+  # geom_bracket(
+  #   aes(
+  #     xmin = days_since_start + 3.8, 
+  #     xmax = days_since_start + 4.2, 
+  #     label = stars
+  #   ), 
+  #   y.position = pi - 0.2,
+  #   tip.length = 0.01,
+  #   size = 1,
+  #   label.size = 5,
+  #   data = tmp_welch
+  # ) +
+  scale_y_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π")
+  ) +
+  scale_fill_manual(values = c("cadetblue3", "coral2")) +
+  scale_color_manual(values = c("cadetblue3", "coral2")) +
+  coord_cartesian(xlim = c(1, 11), ylim = c(-pi, pi), clip = "on") +
+  labs(x = "Days since transition start", y = "Phase (centred on pre-transition period)") +
+  guides(fill = gl, color = gl) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12), 
+    panel.background = element_rect(fill = "white", color = "grey"),
+    legend.position = c(0.92, 0.13),
+    legend.background = element_rect(fill = alpha("grey", 0.4), color = NA)
+  )
+```
+
