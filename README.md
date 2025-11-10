@@ -130,4 +130,12 @@ To view the results without running the notebook yourself, you can download `reg
 
 ## Diurnal rhythm phase extraction
 
-Description to be added.
+The calculation and analysis of diurnal phase is done in `phase_analysis.Rmd`. It is not as extensive as `regress_sleep.Rmd`, but at the same time the analysis is a bit less straightforward, so we will explain some of it here. Again, download and open `phase_analysis.html` in your browser to be able to view results without running the code yourself.
+
+First, after loading the necessary libraries, the key press data is read because they contain information about the time zone the phone was in while typing. To do the phase analysis reported in the paper, we need to know when the time zone transitions occur, so we track down those rows (by comparing the current and previous time zone via `filter(timezone != prev_timezone)`) and calculate some metrics based on the result (e.g., number of days until the next transition). All of this occurs within-participants, of course.
+
+We then read the GRSVD scores, merge them with the time zone transition data, and do some data wrangling to only select those transitions that are in effect for at least seven days, and then we select the first seven days of the GRSVD scores after every such transition (`trip_df`). Using similar logic, we also select the three days leading up to a transition (`baseline_df`).
+
+For our analysis (comparing East- and Westwards travel), all data need to be centred w.r.t. the phase in the days leading up to the transition. That means that, for every transition, we calculate the phase in `baseline_df` and take the mean. This mean forms our centring offset; for ease of calculation we convert it back to an hour.
+
+Next, we merge `baseline_df` and `trip_df`, subtract the hour offset of every timestamp, and calculate the phase. We perform Welch's t-tests between phases associated with East- and Westwards travel (one test per day) and finally plot everything to create the figure shown in Figure 3 of the paper.
