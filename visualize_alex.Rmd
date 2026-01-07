@@ -1,0 +1,1409 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+    df_print: paged
+    toc_float: yes
+    theme: spacelab
+  pdf_document:
+    toc: yes
+---
+
+This notebook visualises the year's worth of typing data from author AL (Alex), and also performs the phase analysis described in `phase_analysis.Rmd`.
+
+```{r setup, message=FALSE}
+library(arrow)
+library(ggpubr)
+library(reshape2)
+library(tidyverse)
+library(ggeffects)
+
+readRenviron(".env")
+
+source("utils.R")
+
+dat_dir <- Sys.getenv("DAT_DIR")
+man_img_dir <- Sys.getenv("MAN_IMG_DIR")
+```
+
+# Load session data
+
+```{r}
+dat_ses <- read_parquet(file.path(dat_dir, "BiAffect_Alex", "dat_ses_alex.parquet"))
+```
+
+```{r results='hide'}
+dat_ses_15 <- dat_ses %>%
+  filter(phoneType == "iPhone 15")
+
+dat_ses_15
+```
+
+Aggregate by hour.
+
+```{r results='hide'}
+dat_hour <- dat_ses_15 %>%
+  group_by(date, hour) %>%
+  summarize(
+    medianIKD = mean(medianIKD),
+    autocorrectRate = mean(autocorrectRate),
+    backspaceRate = mean(backspaceRate),
+    totalKeyPresses = sum(totalKeyPresses),
+    timezone = timezone[1]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    medianIKD = na_if(medianIKD, 0),
+    hour = as.integer(hour),
+    utc_offset = as.integer(str_extract(timezone, "([+-]\\d+):\\d+", group = 1)),
+    timezone = fct_reorder(timezone, utc_offset),
+    timestamp = as_datetime(date) + hours(hour)
+  )
+
+dat_hour
+```
+
+```{r}
+levels(dat_hour$timezone)
+```
+
+# Plot transitions
+
+Create a data frame that 1) delineates the periods spent contiguously in one time zone and 2) indicates when Alex's sleep period starts and ends in UTC+00:00 (where her sleep period is defined as from 11pm to 7am, local time).
+
+```{r}
+max_date <- max(dat_hour$date)
+
+dat_nights <- dat_hour %>%
+  group_by(date) %>%
+  summarize(timezone = last(timezone)) %>%
+  filter(timezone != lag(timezone) | date == min(date)) %>% # Current tz not equal to previous tz
+  mutate(
+    last_date = lead(date, default = max_date) - days(1),
+    utc_offset = as.integer(str_extract(timezone, "([+-]\\d+):\\d+", group = 1)),
+    night_start = (23 - utc_offset) %% 24,
+    night_end = (7 - utc_offset) %% 24,
+    night_start2 = case_when(night_end < night_start ~ 0),
+    night_end2 = case_when(night_end < night_start ~ night_end),
+    night_end = case_when(
+      night_end < night_start ~ 23,
+      TRUE ~ night_end
+    )
+  ) 
+
+dat_nights
+```
+
+
+```{r fig.height=10}
+# t_date <- scales::transform_date()
+
+min_date <- as.Date(min(dat_hour$date) - days(1))
+max_date <- as.Date(max(dat_hour$date) + days(1))
+
+
+g_bubble <- ggplot(dat_hour) +
+  geom_rect(
+    aes(
+      xmin = night_start, xmax = night_end, 
+      ymin = last_date, ymax = date
+    ),
+    fill = "dodgerblue4",
+    alpha = 0.2,
+    data = dat_nights) +
+  geom_rect(
+    aes(
+      xmin = night_start2, xmax = night_end2, 
+      ymin = last_date, ymax = date
+    ), 
+    fill = "dodgerblue4",
+    alpha = 0.2,
+    data = drop_na(dat_nights)) +
+  geom_point(aes(hour, date, size = log(totalKeyPresses), color = timezone)) +
+  scale_y_continuous(
+    limits = c(max_date, min_date), # Reversed
+    transform = c("date", "reverse")
+  ) +
+  scale_color_manual(values = c(
+    "aquamarine2", "aquamarine3", "aquamarine4", "darkslategray", "gray20", 
+    "orangered4", "tomato2", 
+    "goldenrod3", "goldenrod4"
+  )) +
+  labs(x = "Hour", y = "Date", color = "Time zone", size = "log(# key presses)") +
+  # ylim(min_date, max_date) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  theme_minimal() +
+  theme(text = element_text(size = 24))
+
+g_bubble
+
+# ggsave(file.path(man_img_dir, "bubbles.pdf"))
+```
+
+# SVD
+
+Load Alex's GRSVD data.
+
+```{r results='hide'}
+dat_svd <- read_parquet(file.path(dat_dir, "BiAffect_Alex", "svd_long_tail.parquet"))
+
+dat_svd
+```
+
+Create a graphical element for Figure 3 of the paper.
+
+```{r fig.height=4.67, fig.width=2.79}
+zoom_start <- ymd("2023-12-15")
+zoom_end <- ymd("2024-01-31")
+
+ggplot(dat_svd, aes(hour, date)) +
+  geom_tile(aes(fill = value), width = 1, height = 1) +
+  scale_y_continuous(
+    transform = c("date", "reverse"),
+    position = "right",
+    expand = expansion()
+  ) +
+  annotate("rect", xmin = -1, xmax = 24, ymin = zoom_start, ymax = zoom_end, fill = NA, linetype = "dashed", color = "grey", linewidth = 1) +
+  scale_fill_continuous(type = "viridis", guide = guide_colorbar(position = "top"), limits = c(0, NA)) +
+  labs(x = "Hour", y = "Date", fill = "GRSVD score") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    axis.text.y.right = element_text(angle = -90, hjust = 0.5),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.3, "cm"),
+    plot.margin = unit(c(0,1,0,0), "mm")
+  )
+
+# ggsave(file.path(man_img_dir, "alex_phase_analysis", "svd_alex_right_ggplot.pdf"))
+```
+
+Create a zoomed-in version of the GRSVD plot (for a powerpoint slide).
+
+```{r fig.height=8, fig.width=8}
+zoom_start <- ymd("2023-12-15")
+zoom_end <- ymd("2024-01-31")
+
+ggplot(dat_svd, aes(hour, date)) +
+  geom_tile(aes(fill = value), width = 1, height = 1) +
+  scale_y_continuous(
+    limits = c(zoom_end, zoom_start), # Reversed
+    transform = c("date", "reverse")
+  ) +
+  scale_fill_continuous(type = "viridis", guide = guide_colorbar(position = "top")) +
+  labs(x = "Hour", y = "Date", fill = "Typing activity value") +
+  theme_minimal() +
+  theme(text = element_text(size = 18))
+```
+
+Get the exact moment BiAffect records a time zone transition.
+
+```{r results='hide'}
+dat_transition <- dat_ses_15 %>%
+  mutate(
+    utc_offset = as.integer(str_extract(timezone, "([+-]\\d+):\\d+", group = 1)),
+    timezone = fct_reorder(timezone, utc_offset),
+    prev_timezone = lag(timezone)
+  ) %>%
+  filter(timezone != prev_timezone | is.na(prev_timezone)) %>%
+  select(session_timestamp, timezone, prev_timezone) %>%
+  mutate(next_timestamp = lead(session_timestamp))
+
+# write_parquet(dat_transition,
+#               file.path(dat_dir, "BiAffect_Alex", "dat_transition_alex.parquet"))
+
+dat_transition
+```
+
+Plot the GRSVD values over time for Alex's trip to Asia.
+
+```{r fig.height=8}
+zoom_start_dt <- as_datetime(zoom_start)
+zoom_end_dt <- as_datetime(zoom_end)
+
+dat_svd_ts <- dat_svd %>%
+  mutate(timestamp = as_datetime(date) + hours(hour)) %>%
+  filter(timestamp >= zoom_start_dt,
+         timestamp <= zoom_end_dt)
+
+g_svd <- ggplot(dat_svd_ts) +
+  geom_rect(aes(xmin = session_timestamp, xmax = next_timestamp, 
+                ymin = -1, ymax = 5, fill = timezone), 
+            alpha = 0.5, data = dat_transition) +
+  geom_line(aes(timestamp, value)) +
+  geom_point(aes(timestamp, value, color = value)) +
+  scale_color_continuous(type = "viridis") +
+  scale_fill_manual(values = c(
+    "aquamarine2", "aquamarine3", "aquamarine4", "darkslategray", "gray20", 
+    "black", "orangered4", "tomato2",
+    "goldenrod3", "goldenrod4"
+  )) +
+  geom_vline(aes(xintercept = session_timestamp), data = dat_transition) +
+  labs(x = NULL, y = "Typing activity value", color = "Typing activity value", fill = "Time zone") +
+  coord_cartesian(xlim = c(zoom_start_dt, zoom_end_dt), ylim = c(0, 4))
+
+# So we can easily combine g_svd with other plots later on
+g_svd +
+  xlab("Time") +
+  theme(text = element_text(size = 18))
+
+# ggsave(file.path(man_img_dir, "svd_fluctuations_label2.pdf"))
+```
+
+## Relation to keyboard metrics
+
+Here we eyeball whether there are any obvious relationships between the GRSVD rhythm disturbances and the BiAffect metrics. Unfortunately, no such relationship is apparent.
+
+```{r fig.height=8}
+tmp <- dat_hour %>%
+  mutate(log_medianIKD = log(medianIKD)) %>%
+  pivot_longer(c(backspaceRate, autocorrectRate, log_medianIKD), names_to = "variable") %>%
+  filter(timestamp >= zoom_start_dt, timestamp <= zoom_end_dt)
+
+var_labs <- c(
+  backspaceRate = "Backspace rate", 
+  autocorrectRate = "Autocorrect rate", 
+  log_medianIKD = "log(Median IKD)"
+)
+
+g_vars <- ggplot(tmp, aes(timestamp, value)) +
+  geom_line() +
+  xlim(zoom_start_dt, zoom_end_dt) +
+  facet_wrap(~ variable, ncol = 1, scales = "free_y", 
+             labeller = as_labeller(var_labs)) +
+  labs(x = "Time", y = "Value") +
+  theme_minimal()
+
+g_vars
+```
+
+```{r fig.height=10}
+ggarrange(g_svd, g_vars, ncol = 1, align = "v", common.legend = TRUE)
+```
+
+Moving variances, 95th quantile, and spectrogram of the GRSVD values.
+
+```{r}
+filter_width <- 7 * 24 # Seven days
+
+variances <- vector("numeric", nrow(dat_svd_ts))
+quantiles <- vector("numeric", nrow(dat_svd_ts))
+specs <- matrix(nrow = nrow(dat_svd_ts), ncol = 90)
+
+for (i in 1:nrow(dat_svd_ts)) {
+  window_start <- i - filter_width / 2
+  window_end <- i + filter_width / 2
+  
+  if (window_start > 1 && window_end < nrow(dat_svd_ts)) {
+    values <- dat_svd_ts$value[window_start:window_end]
+    values_ts <- ts(values, frequency = 24)
+    
+    variances[i] <- var(values)
+    quantiles[i] <- quantile(values, 0.05)
+    specs[i,] <- spectrum(values_ts, plot = FALSE, span = c(3, 5))$spec
+  } else {
+    variances[i] <- NA
+    quantiles[i] <- NA
+    specs[i,] <- NA
+  }
+}
+```
+
+```{r results='hide'}
+freqs <- seq(0, 12, length.out = dim(specs)[2])
+
+spec_df <- melt(specs) %>%
+  rename(timestamp = Var1, frequency = Var2) %>%
+  mutate(
+    timestamp = rep(dat_svd_ts$timestamp, times = length(freqs)), 
+    frequency = rep(freqs, each = length(dat_svd_ts$timestamp))
+  )
+
+spec_df
+```
+
+
+```{r}
+g_spec <- ggplot(spec_df, aes(timestamp, frequency)) +
+  geom_raster(aes(fill = log(value)))
+
+g_spec
+```
+
+```{r fig.height=8}
+ggarrange(g_svd, g_spec, ncol = 1, common.legend = TRUE, align = "v")
+```
+
+The quantiles show some promise for capturing the disturbances shown in the GRSVD line plot.
+
+```{r fig.height=8}
+dat_svd_var <- dat_svd_ts %>%
+  mutate(
+    variance = variances,
+    quantile = quantiles
+  ) %>%
+  pivot_longer(c(value, variance, quantile), names_to = "variable")
+
+ggplot(dat_svd_var) +
+  geom_line(aes(timestamp, value)) +
+  geom_point(aes(timestamp, value, color = value)) +
+  scale_color_continuous(type = "viridis") +
+  facet_grid(rows = vars(variable), scales = "free_y") +
+  geom_vline(aes(xintercept = session_timestamp), data = dat_transition) +
+  labs(x = NULL, y = "Value", color = "SVD value", fill = "Timezone") +
+  coord_cartesian(xlim = c(zoom_start_dt, zoom_end_dt)) +
+  theme(text = element_text(size = 18))
+```
+
+
+# Fourier analysis SVD
+
+Any obvious and meaningful changes in Fourier periodogram before and during the trip? Not that I can see.
+
+Whole time series.
+
+```{r}
+# 24 observations per day
+svd_ts <- ts(dat_svd_ts$value, frequency = 24)
+
+sp <- spectrum(svd_ts, spans = c(3, 5))
+```
+
+Section surrounding flight to Japan: 2023-12-25 - 2024-01-01
+
+```{r}
+tmp <- dat_svd_ts %>%
+  filter(ymd("2023-12-25") <= date, date <= ymd("2024-01-01"))
+
+plot(tmp$value)
+
+svd_ts_japan <- ts(tmp$value, frequency = 24)
+
+spectrum(svd_ts_japan)
+```
+
+Before flight to Japan: 2023-12-15 - 2023-12-23
+
+```{r}
+tmp <- dat_svd_ts %>%
+  filter(ymd("2023-12-15") <= date, date <= ymd("2023-12-23"))
+
+plot(tmp$value)
+
+svd_ts_chicago <- ts(tmp$value, frequency = 24)
+
+spectrum(svd_ts_chicago)
+```
+
+# Combining bubble and fluctuation plots
+
+Figure elements for an older version of the paper.
+
+```{r fig.height=8}
+g_bubble2 <- g_bubble +
+  theme(text = element_text(size = 18)) +
+  scale_size(range = c(1, 3)) +
+  geom_rect(
+    aes(xmin = -1, xmax = 24, ymin = zoom_start, ymax = zoom_end), 
+    fill = NA, linetype = "dashed", color = "grey30", linejoin = "round", 
+    data = data.frame(x = 1)) # Dummy data frame to prevent redrawing
+
+g_svd2 <- g_svd +
+  xlab("Time") +
+  theme(
+    text = element_text(size = 18),
+    legend.text = element_text(size = 14)
+  ) +
+  guides(fill = "none")
+
+ggarrange(g_bubble2, g_svd2, legend = "none")
+
+# ggsave(file.path(man_img_dir, "alex_fluctuations", "alex_fluctuations_no_legend.pdf"))
+```
+
+```{r fig.height=10}
+g_legends <- ggarrange(
+  get_legend(g_bubble2, position = "top"),
+  get_legend(g_svd2, position = "top"),
+  widths = c(4, 1)
+)
+
+g_legends
+
+# ggsave(file.path(man_img_dir, "alex_fluctuations", "alex_fluctuations_legend.pdf"))
+```
+
+# Combining bubble and SVD plots
+
+Figure elements for an older version of the paper.
+
+```{r fig.height=5, fig.width=8.3}
+g_bubble3 <- g_bubble +
+  scale_size(range = c(0.1, 1.5)) +
+  labs(tag = "A") +
+  theme(text = element_text(size = 16))
+
+# geom_rect(
+#     aes(
+#       xmin = night_start, xmax = night_end, 
+#       ymin = last_date, ymax = date
+#     ),
+#     fill = "dodgerblue4",
+#     alpha = 0.2,
+#     data = dat_nights) +
+#   geom_rect(
+#     aes(
+#       xmin = night_start2, xmax = night_end2, 
+#       ymin = last_date, ymax = date
+#     ), 
+#     fill = "dodgerblue4",
+#     alpha = 0.2,
+#     data = drop_na(dat_nights)) +
+#   geom_point(aes(hour, date, size = log(totalKeyPresses), color = timezone)) +
+#   scale_y_continuous(
+#     limits = c(max_date, min_date), # Reversed
+#     transform = c("date", "reverse")
+#   ) +
+
+g_svd3 <- ggplot(dat_svd, aes(hour, date)) +
+  geom_tile(aes(fill = value), width = 1, height = 1) +
+  geom_rect(aes(xmin = -1, xmax = 24, ymin = zoom_end, ymax = zoom_start), 
+            fill = NA, color = "grey", linetype = "dashed") +
+  # ymin = last_date, ymax = date
+  xlab("Hour") +
+  scale_fill_continuous(type = "viridis") +
+  scale_y_continuous(
+    transform = c("date", "reverse")
+  ) +
+  labs(x = "Hour", tag = "B", fill = "SVD value") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 16),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+ggarrange(g_bubble3, g_svd3, nrow = 1, widths = c(5, 4), legend = "none")
+
+# ggsave(file.path(man_img_dir, "alex_phase_analysis", "phase_analysis_top2.pdf"))
+```
+
+```{r fig.height=0.8, fig.width=15}
+g_legends2 <- ggarrange(
+  get_legend(g_bubble3, position = "top"),
+  get_legend(g_svd3, position = "top"),
+  widths = c(4, 1)
+)
+
+g_legends2
+
+# ggsave(file.path(man_img_dir, "alex_phase_analysis", "phase_analysis_legend.pdf"))
+```
+
+
+# Data from pull 2025-01-09
+
+Visualisation and exploration of a second data pull.
+
+```{r}
+# Second pull
+dat_ses_p2 <- read_parquet(file.path(dat_dir, "BiAffect_Alex", 
+                                     "dat_ses_alex_pull_2025-01-09.parquet"))
+```
+
+```{r results='hide'}
+dat_ses_p2_15 <- dat_ses_p2 %>%
+  filter(phoneType == "iPhone 15")
+
+dat_ses_p2_15
+```
+
+```{r}
+dat_hour_p2 <- dat_ses_p2_15 %>%
+  group_by(date, hour) %>%
+  summarize(
+    medianIKD = mean(medianIKD),
+    autocorrectRate = mean(autocorrectRate),
+    backspaceRate = mean(backspaceRate),
+    totalKeyPresses = sum(totalKeyPresses),
+    upright = mean(upright),
+    timezone = timezone[1]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    medianIKD = na_if(medianIKD, 0),
+    hour = as.integer(hour),
+    utc_offset = as.integer(str_extract(timezone, "([+-]\\d+):\\d+", group = 1)),
+    timezone = fct_reorder(timezone, utc_offset),
+    timestamp = as_datetime(date) + hours(hour)
+  )
+
+max_date_tmp <- max(dat_hour_p2$date)
+
+dat_nights_p2 <- dat_hour_p2 %>%
+  group_by(date) %>%
+  summarize(timezone = last(timezone)) %>%
+  filter(timezone != lag(timezone) | date == min(date)) %>% # Current tz not equal to previous tz
+  mutate(
+    last_date = lead(date, default = max_date_tmp) - days(1),
+    utc_offset = as.integer(str_extract(timezone, "([+-]\\d+):\\d+", group = 1)),
+    night_start = (23 - utc_offset) %% 24,
+    night_end = (7 - utc_offset) %% 24,
+    night_start2 = case_when(night_end < night_start ~ 0),
+    night_end2 = case_when(night_end < night_start ~ night_end),
+    night_end = case_when(
+      night_end < night_start ~ 23,
+      TRUE ~ night_end
+    )
+  )
+
+min_date_p2 <- as.Date(min(dat_hour_p2$date) - days(1))
+max_date_p2 <- as.Date(max(dat_hour_p2$date) + days(1))
+```
+
+
+```{r fig.height=8}
+ggplot(dat_hour_p2) +
+  geom_rect(
+    aes(
+      xmin = night_start, xmax = night_end, 
+      ymin = last_date, ymax = date
+    ),
+    fill = "dodgerblue4",
+    alpha = 0.2,
+    data = dat_nights_p2) +
+  geom_rect(
+    aes(
+      xmin = night_start2, xmax = night_end2, 
+      ymin = last_date, ymax = date
+    ), 
+    fill = "dodgerblue4",
+    alpha = 0.2,
+    data = drop_na(dat_nights_p2)) +
+  geom_point(aes(hour, date, size = log(totalKeyPresses), color = timezone)) +
+  scale_y_continuous(
+    limits = c(max_date_p2, min_date_p2), # Reversed
+    transform = c("date", "reverse")
+  ) +
+  scale_color_manual(values = c(
+    "aquamarine2", "aquamarine3", "aquamarine4", "darkslategray", "gray20", 
+    "orangered4", "tomato2", 
+    "goldenrod3", "goldenrod4"
+  )) +
+  labs(x = "Hour", y = "Date", color = "Time zone", size = "log(# key presses)") +
+  # ylim(min_date, max_date) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  theme_minimal() +
+  theme(text = element_text(size = 24))
+```
+
+```{r fig.height=8}
+ggplot(dat_hour_p2) +
+  geom_rect(
+    aes(
+      xmin = night_start, xmax = night_end, 
+      ymin = last_date, ymax = date
+    ),
+    fill = "dodgerblue4",
+    alpha = 0.2,
+    data = dat_nights_p2) +
+  geom_rect(
+    aes(
+      xmin = night_start2, xmax = night_end2, 
+      ymin = last_date, ymax = date
+    ), 
+    fill = "dodgerblue4",
+    alpha = 0.2,
+    data = drop_na(dat_nights_p2)) +
+  geom_point(aes(hour, date, size = log(totalKeyPresses), color = 1 - upright)) +
+  scale_y_continuous(
+    limits = c(max_date_p2, min_date_p2), # Reversed
+    transform = c("date", "reverse")
+  ) +
+  scale_color_continuous(type = "viridis", guide = "colorbar") +
+  labs(x = "Hour (UTC)", y = "Date", color = "Lie-down rate", size = "log(# key presses)") +
+  # ylim(min_date, max_date) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 24),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 20, hjust = 0)
+  )
+
+# ggsave(file.path("images", "orientation_alex_2025.pdf"))
+```
+
+Autocorrect-backspace trajectory. No obvious patterns.
+
+```{r}
+tmp <- dat_hour_p2 %>%
+  ungroup() %>%
+  mutate(time = 1:n())
+
+ggplot(tmp, aes(autocorrectRate, backspaceRate)) +
+  geom_point(aes(color = time))
+
+ggplot(tmp, aes(autocorrectRate, backspaceRate)) +
+  geom_point(aes(color = timezone))
+```
+
+Moving average of autocorrect rate and backspace rate. Rolling window of 24 hours, advancing by one hour.
+
+```{r}
+n_days <- n_distinct(dat_ses_p2_15$date)
+
+filter_width <- 24 # One day
+start_dt <- as_datetime(min(dat_ses_p2_15$date))
+end_dt <- as_datetime(max(dat_ses_p2_15$date) + days(1))
+
+ac_rates <- vector("numeric", 24 * n_days)
+bs_rates <- vector("numeric", 24 * n_days)
+
+for (i in 1:(24 * n_days)) {
+  window_start <- start_dt + hours(i - filter_width / 2)
+  window_end <- start_dt + hours(i + filter_width / 2)
+  
+  if (window_start > start_dt && window_end < end_dt) {
+    df <- dat_ses_p2_15 %>% 
+      filter(session_timestamp >= window_start, session_timestamp < window_end)
+    
+    ac_rates[i] <- mean(df$autocorrectRate)
+    bs_rates[i] <- mean(df$backspaceRate)
+  } else {
+    ac_rates[i] <- NA
+    bs_rates[i] <- NA
+  }
+}
+```
+
+```{r}
+tz_transitions_p2 <- dat_hour_p2 %>%
+  filter(timezone != lag(timezone) | timestamp == min(timestamp)) %>%
+  select(timezone, timestamp)
+
+tz_transitions_p2
+```
+
+```{r results='hide'}
+ac_bs_df <- data.frame(
+  autocorrect = ac_rates,
+  backspace = bs_rates,
+  time = start_dt + hours(1:(24 * n_days))
+) %>%
+  left_join(tz_transitions_p2, by = c("time" = "timestamp")) %>%
+  fill(timezone, .direction = "downup")
+
+ac_bs_df
+```
+
+There is a little separation for UTC-07:00 from UTC+08:00 and UTC+09:00, but almost all points overlap with UTC-06:00.
+
+```{r}
+ggplot(ac_bs_df, aes(autocorrect, backspace)) +
+  geom_point(aes(color = time)) +
+  scale_color_continuous(transform = c("time", "reverse"))
+
+ggplot(ac_bs_df, aes(autocorrect, backspace)) +
+  geom_point(aes(color = timezone))
+
+# ggsave(file.path("images", "autocorrect_backspace_alex.pdf"))
+```
+
+# Pull 2025-02-21
+
+Quick visualisation of third data pull, which also includes the previous pulls.
+
+```{r}
+dat_ses_p3 <- read_parquet(file.path(dat_dir, "BiAffect_Alex", "dat_ses_alex_pull_2025-02-21.parquet"))
+```
+
+```{r results='hide'}
+dat_ses_15_p3 <- dat_ses_p3 %>%
+  filter(phoneType == "iPhone 15")
+
+dat_ses_15_p3
+```
+
+```{r results='hide'}
+dat_hour_p3 <- dat_ses_15_p3 %>%
+  group_by(date, hour) %>%
+  summarize(
+    medianIKD = mean(medianIKD),
+    autocorrectRate = mean(autocorrectRate),
+    backspaceRate = mean(backspaceRate),
+    totalKeyPresses = sum(totalKeyPresses),
+    timezone = timezone[1]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    medianIKD = na_if(medianIKD, 0),
+    hour = as.integer(hour),
+    utc_offset = as.integer(str_extract(timezone, "([+-]\\d+):\\d+", group = 1)),
+    timezone = fct_reorder(timezone, utc_offset),
+    timestamp = as_datetime(date) + hours(hour)
+  )
+
+dat_hour_p3
+```
+
+```{r fig.height=10}
+# t_date <- scales::transform_date()
+
+min_date <- as.Date(min(dat_hour_p3$date) - days(1))
+max_date <- as.Date(max(dat_hour_p3$date) + days(1))
+
+
+ggplot(dat_hour_p3) +
+  geom_point(aes(hour, date, size = log(totalKeyPresses), color = timezone)) +
+  scale_y_continuous(
+    limits = c(max_date, min_date), # Reversed
+    transform = c("date", "reverse")
+  ) +
+  scale_color_manual(values = c(
+    "aquamarine2", "aquamarine3", "aquamarine4", "darkslategray", "gray20", 
+    "orangered4", "tomato2", 
+    "goldenrod3", "goldenrod4"
+  )) +
+  labs(x = "Hour", y = "Date", color = "Time zone", size = "log(# key presses)") +
+  # ylim(min_date, max_date) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  theme_minimal() +
+  theme(text = element_text(size = 24))
+```
+
+# Cosine similarity
+
+This was a candidate metric for capturing phase shifts in someone's diurnal rhythm before we settled on the circular mean approach.
+
+```{r}
+svd_mat <- matrix(dat_svd$value, ncol = 24, byrow = TRUE)
+
+# plot(c(t(svd_mat[1:30,])), type = "l")
+
+# null_vector = numeric(length = 24)
+# null_vector[1] = 1
+
+null_vector <- svd_mat[10,]
+
+null_mag <- sqrt(sum(null_vector^2))
+
+# Vector of dot products
+dots = svd_mat %*% null_vector
+
+cos_sims = dots / (sqrt(rowSums(svd_mat^2)) * null_mag)
+
+plot(cos_sims, type = "l")
+```
+
+```{r results='hide'}
+dat_svd$cos_sim <- rep(cos_sims, each = 24)
+
+dat_svd
+```
+
+```{r fig.height=10}
+zoom_start_dt <- as_datetime(zoom_start)
+zoom_end_dt <- as_datetime(zoom_end)
+
+dat_svd_ts_longer <- dat_svd %>%
+  mutate(timestamp = as_datetime(date) + hours(hour)) %>%
+  filter(timestamp >= zoom_start_dt,
+         timestamp <= zoom_end_dt) %>%
+  rename(svd_value = value) %>%
+  pivot_longer(c(svd_value, cos_sim), names_to = "variable")
+
+ggplot(dat_svd_ts_longer) +
+  # geom_rect(aes(xmin = session_timestamp, xmax = next_timestamp, 
+  #               ymin = -1, ymax = 5, fill = timezone), 
+  #           alpha = 0.5, data = dat_transition) +
+  geom_line(aes(timestamp, value)) +
+  geom_point(aes(timestamp, value, color = value)) +
+  scale_color_continuous(type = "viridis") +
+  scale_fill_manual(values = c(
+    "aquamarine2", "aquamarine3", "aquamarine4", "darkslategray", "gray20", 
+    "black", "orangered4", "tomato2",
+    "goldenrod3", "goldenrod4"
+  )) +
+  geom_vline(aes(xintercept = session_timestamp), data = dat_transition) +
+  labs(x = NULL, y = "Typing activity value", color = "Typing activity value", fill = "Time zone") +
+  facet_wrap(~ variable, ncol = 1, scales = "free_y") +
+  coord_cartesian(xlim = c(zoom_start_dt, zoom_end_dt)) +
+  xlab("Time") +
+  theme(text = element_text(size = 18))
+```
+
+# TOD prediction
+
+Showing that the GRSVD value and time of day are linked. If this link gets shifted by a new time zone, this can be quantified as an error in predicting the GRSVD value from the time of day, and this in turn can be another quantification of the diurnal rhythm phase.
+
+```{r}
+# Stable period
+stable_start <- ymd("2024-08-01")
+stable_end <- ymd("2024-08-31")
+
+dat_svd_stable <- dat_svd %>%
+  filter(between(date, stable_start, stable_end)) %>%
+  mutate(hour_local = (hour - 6) %% 24)
+
+ggplot(dat_svd_stable, aes(hour_local, value)) +
+  geom_point()
+
+# Shows that hour_local ~ value is not a function
+ggplot(dat_svd_stable, aes(value, hour_local)) +
+  geom_point()
+```
+
+Cosine basis expansion does not quite capture the pattern.
+
+```{r}
+m_tod_1 <- lm(value ~ cos(2*pi / 24 * hour_local) + hour_local, dat_svd_stable)
+
+summary(m_tod_1)
+```
+
+```{r fig.height=8}
+plot(predict_response(m_tod_1, terms = "hour_local"), show_data = TRUE, jitter = 0.1) +
+  theme(text = element_text(size = 16))
+```
+
+LOESS does a slightly better job.
+
+```{r}
+m_tod_2 <- loess(value ~ hour_local, dat_svd_stable, span = 0.5)
+
+summary(m_tod_2)
+```
+
+```{r fig.height=8}
+with(dat_svd_stable, {
+  plot(hour_local, value)
+  
+  idx <- order(hour_local)
+  lines(hour_local[idx], m_tod_2$fitted[idx])
+})
+```
+
+```{r}
+qqnorm(resid(m_tod_2))
+qqline(resid(m_tod_2))
+
+hist(resid(m_tod_2), breaks = 30)
+```
+
+LOESS is sufficient for now.
+
+```{r}
+tz_transitions <- dat_hour %>%
+  filter(timezone != lag(timezone) | timestamp == min(timestamp)) %>%
+  select(timezone, utc_offset, timestamp)
+
+tz_transitions
+```
+
+```{r results='hide'}
+dat_svd_local <- dat_svd %>%
+  mutate(timestamp = as_datetime(date) + hours(hour)) %>%
+  full_join(tz_transitions, by = c("timestamp")) %>%
+  arrange(timestamp) %>%
+  fill(c(timezone, utc_offset), .direction = "downup") %>%
+  mutate(
+    hour_local = (hour + utc_offset) %% 24,
+    hour_utc_min6 = (hour - 6) %% 24
+  ) %>%
+  drop_na()
+
+dat_svd_local
+```
+
+```{r results='hide'}
+dat_svd_predict_tod <- dat_svd_local %>%
+  add_column(
+    predicted = predict(m_tod_2, newdata = dat_svd_local),
+    predicted_utc_min6 = predict(m_tod_2, newdata = mutate(dat_svd_local, hour_local = hour_utc_min6))
+  ) %>%
+  mutate(
+    error = value - predicted,
+    error_utc_min6 = value - predicted_utc_min6,
+    sq_error = error^2,
+    sq_error_utc_min6 = error_utc_min6^2
+  )
+
+dat_svd_predict_tod
+
+dat_svd_predict_daily <- dat_svd_predict_tod %>%
+  group_by(date) %>%
+  summarize(
+    sq_error = mean(sq_error),
+    sq_error_utc_min6 = mean(sq_error_utc_min6),
+    timezone = last(timezone),
+    cos_sim = first(cos_sim)
+  )
+
+dat_svd_predict_daily
+```
+
+```{r}
+ggplot(dat_svd_predict_tod, aes(timestamp, sq_error)) +
+  geom_line() +
+  geom_point(aes(color = timezone)) +
+  xlim(zoom_start_dt, zoom_end_dt)
+
+ggplot(dat_svd_predict_daily, aes(date, sq_error)) +
+  geom_line() +
+  geom_point(aes(color = timezone)) +
+  xlim(zoom_start, ymd("2024-03-01"))
+
+ggplot(dat_svd_predict_daily, aes(date, sq_error_utc_min6)) +
+  geom_line() +
+  geom_point(aes(color = timezone)) +
+  xlim(zoom_start, ymd("2024-03-01"))
+```
+
+```{r fig.height=8}
+ggplot(dat_svd_predict_daily, aes(date, sq_error)) +
+  geom_line() +
+  geom_point(aes(color = timezone), size = 2) +
+  theme_minimal() +
+  labs(x = "Date", y = "Squared error for local time zone", color = "Time zone") +
+  theme(text = element_text(size = 18))
+
+ggplot(dat_svd_predict_daily, aes(date, sq_error_utc_min6)) +
+  geom_line() +
+  geom_point(aes(color = timezone), size = 2) +
+  theme_minimal() +
+  labs(x = "Date", y = "Squared error for UTC-06:00", color = "Time zone") +
+  theme(text = element_text(size = 18))
+```
+
+Comparing cosine similarity and squared error of the LOESS model as phase metrics.
+
+```{r fig.height=8}
+tmp <- dat_svd_predict_daily %>%
+  pivot_longer(c(sq_error_utc_min6, cos_sim), names_to = "variable")
+
+ggplot(tmp, aes(date, value)) +
+  geom_line() +
+  geom_point(aes(color = timezone), size = 2) +
+  facet_wrap(~ variable, ncol = 1, scales = "free_y", 
+             labeller = as_labeller(c(
+               cos_sim = "Cosine similarity", 
+               sq_error_utc_min6 = "Squared error for UTC-06:00"
+             ))) +
+  theme_minimal() +
+  labs(x = "Date", y = "Value", color = "Time zone") +
+  theme(text = element_text(size = 18))
+```
+
+# Phase analysis
+
+This uses the circular mean approach to calculate phase metrics. We then do a quantitative comparison between East- and Westwards travel. Follows a similar approach to `phase_analysis.Rmd`.
+
+```{r results='hide'}
+parse_tz <- function(tz) {
+  tz <- as.character(tz)
+  hours <- as.integer(str_extract(tz, "[+-]\\d+"))
+  minutes <- as.integer(str_match(tz, ":(\\d+)")[,2])
+  
+  hours + sign(hours) * minutes / 60
+}
+
+# Are there multiple transitions in a single day? Then merge them
+consolidate_transitions <- function(df) {
+  excluded <- vector("integer")
+  
+  for (i in 1:nrow(df)) {
+    dtnt <- df[i, "days_to_next_transition"]
+    if (!is.na(dtnt) && dtnt == 0) {
+      # Move some values to the next row, then mark current row for deletion
+      for (variable in c("session_timestamp", "prev_timezone", "date", "hour"))
+        df[i+1, variable] <- df[i, variable]
+      
+      excluded <- c(excluded, i)
+    }
+  }
+  
+  df[-excluded,]
+}
+
+last_trip_length <- max(dat_ses_15$date) - max(date(dat_transition$session_timestamp))
+
+trip_starts_alex <- dat_transition %>%
+  select(!next_timestamp) %>%
+  mutate(
+    date = date(session_timestamp),
+    hour = hour(session_timestamp),
+    days_to_next_transition = lead(date) - date,
+    days_to_next_transition = replace_na(days_to_next_transition, last_trip_length)
+  ) %>%
+  relocate(prev_timezone, .before = timezone) %>%
+  consolidate_transitions() %>%
+  mutate(
+    diff_tz = parse_tz(timezone) - parse_tz(prev_timezone),
+    # Assume travel direction corresponds to shortest distance
+    diff_tz = case_when(
+      abs(diff_tz) > 12 ~ -sign(diff_tz) * (24 - abs(diff_tz)),
+      TRUE ~ diff_tz
+    ),
+    trip_id = 1:n(),
+    trip_date = date
+  ) %>%
+  filter(days_to_next_transition >= 7) %>%
+  select(!c(days_to_next_transition, session_timestamp))
+
+trip_starts_alex
+```
+
+Trip selection logic is from phase_analysis.Rmd
+
+```{r results='hide'}
+trips_alex_df <- dat_svd %>%
+  full_join(trip_starts_alex, by = c("date", "hour")) %>%
+  arrange(date, hour) %>%
+  group_by(date) %>%
+  fill(trip_id, trip_date, diff_tz, timezone, prev_timezone, .direction = "downup") %>%
+  ungroup() %>%
+  fill(trip_id, trip_date, diff_tz, timezone, prev_timezone, .direction = "down") %>%
+  group_by(trip_id) %>%
+  mutate(
+    days_since_start = date - trip_date,
+    period = "transition"
+  ) %>%
+  filter(days_since_start <= 7) %>%
+  ungroup()
+
+trips_alex_df
+```
+
+```{r results='hide'}
+baseline_alex_df <- dat_svd %>%
+  full_join(trip_starts_alex, by = c("date", "hour")) %>%
+  arrange(date, hour) %>%
+  # ID might leak into other trips, so select only first 3 days
+  fill(trip_id, trip_date, diff_tz, timezone, prev_timezone, .direction = "up") %>%
+  group_by(trip_id) %>%
+  mutate(
+    days_since_start = date - trip_date,
+    period = "baseline"
+  ) %>%
+  filter(days_since_start >= -3, days_since_start < 0) %>%
+  ungroup()
+
+baseline_alex_df
+```
+
+```{r results='hide'}
+baseline_offsets_alex <- baseline_alex_df %>%
+  mutate(
+    theta = hour / 24 * 2 * pi,
+    x = value * cos(theta),
+    y = value * sin(theta)
+  ) %>%
+  group_by(trip_id, date) %>%
+  summarize(
+    x_mean = mean(x),
+    y_mean = mean(y),
+    phase = atan2(y_mean, x_mean)
+  ) %>%
+  group_by(trip_id) %>%
+  summarize(
+    phase_mean = atan2(sum(sin(phase)), sum(cos(phase))),
+    hour = phase_mean / (2 * pi) * 24
+  ) %>%
+  rename(phase_offset = phase_mean, hour_offset = hour)
+
+baseline_offsets_alex
+```
+
+```{r results='hide'}
+trip_bl_alex_df <- trips_alex_df %>%
+  bind_rows(baseline_alex_df) %>%
+  arrange(trip_id, date, hour) %>%
+  left_join(baseline_offsets_alex, by = c("trip_id"))
+
+trip_bl_alex_df
+```
+
+```{r results='hide'}
+phase_alex <- trip_bl_alex_df %>%
+  mutate(
+    theta = hour / 24 * 2 * pi,
+    # theta_local = (hour + prev_timezone / 100 + 6) %% 24 / 24 * 2 * pi,
+    theta_offset = (hour - hour_offset) / 24 * 2 * pi,
+    x = value * cos(theta_offset),
+    y = value * sin(theta_offset)
+  ) %>%
+  group_by(trip_id, date) %>%
+  summarize(
+    x_mean = mean(x),
+    y_mean = mean(y),
+    phase = atan2(y_mean, x_mean),
+    phase_offset = phase_offset[1],
+    radius = sqrt(x_mean^2 + y_mean^2),
+    days_since_start = days_since_start[1],
+    diff_tz = diff_tz[1],
+    period = period[1]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    diff_sign = factor(sign(diff_tz), levels = c(-1, 1), labels = c("Westwards", "Eastwards")),
+    days_since_start = as.numeric(days_since_start)
+  ) %>%
+  drop_na(phase)
+
+phase_alex
+```
+
+```{r results='hide'}
+welch_alex <- welch_tests(phase_alex)
+
+welch_alex
+```
+
+```{r eval=FALSE, include=FALSE}
+format_welch(welch_alex) %>%
+  write_csv(file.path(man_img_dir, "welch_alex.csv"))
+```
+
+Phase metric over days before and since trip start, coloured by direction of travel.
+
+```{r}
+ggplot(phase_alex, aes(days_since_start, phase)) +
+  geom_line(aes(group = trip_id, color = diff_sign))
+```
+
+Part of Figure 3.
+
+Original width=5, height=2.5
+
+```{r fig.width=8}
+gl <- guide_legend(title = NULL, position = "inside")
+
+tmp_welch <- welch_alex %>%
+  filter(p_value < 0.05)
+
+ggplot(phase_alex, aes(as.factor(days_since_start), phase)) +
+  annotate("rect", xmin = 0, xmax = 3.5, ymin = -1.5*pi, ymax = 1.5*pi, alpha = 0.3) +
+  annotate("rect", xmin = 0, xmax = 3.5, ymin = pi-0.3, ymax = 1.5*pi, alpha = 0.3) +
+  geom_point(aes(color = diff_sign)) + # Define x scale data type before text annotation
+  geom_line(aes(color = diff_sign, group = trip_id), alpha = 0.1) +
+  annotate("text", x = 1.95, y = pi, label = "Pre-transition", size = 3.5) +
+  geom_boxplot(aes(fill = diff_sign), outlier.shape = NA) +
+  geom_bracket(
+    aes(
+      xmin = days_since_start + 3.8,
+      xmax = days_since_start + 4.2,
+      label = stars
+    ),
+    y.position = pi - 0.4,
+    tip.length = 0.01,
+    size = 1,
+    label.size = 5,
+    data = tmp_welch
+  ) +
+  scale_y_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π")
+  ) +
+  coord_cartesian(xlim = c(1, 11), ylim = c(-pi, pi), clip = "on") +
+  labs(x = "Days since transition start", y = "Phase (centred on pre-transition)") +
+  guides(fill = gl, color = gl) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12), 
+    axis.title.y = element_text(size = 10, hjust = 1),
+    axis.title.x = element_text(size = 12),
+    panel.background = element_rect(fill = "white", color = "grey"),
+    legend.position.inside = c(0.14, 0.18)
+  )
+
+# ggsave(file.path(man_img_dir, "alex_phase_analysis", "boxplots_alex_larger.pdf"),
+#        device = cairo_pdf)
+```
+
+## 2nd review analysis
+
+Here, we plot phase by time zone. We also have some experimental code for doing the phase analysis w.r.t. local time rather than a universal time zone, but the code is experimental and there are too few data to check if it works as intended.
+
+Merge transitions that occur in a single day.
+
+```{r results='hide'}
+dat_transition_consolidated <- dat_transition %>%
+  select(!next_timestamp) %>%
+  mutate(
+    date = date(session_timestamp),
+    hour = hour(session_timestamp),
+    days_to_next_transition = lead(date) - date,
+    days_to_next_transition = replace_na(days_to_next_transition, last_trip_length)
+  ) %>%
+  relocate(prev_timezone, .before = timezone) %>%
+  consolidate_transitions()
+
+dat_transition_consolidated
+```
+
+```{r results='hide'}
+alex_svd_tz <- dat_svd %>%
+  full_join(dat_transition_consolidated, by = c("date", "hour")) %>%
+  arrange(date, hour) %>%
+  group_by(date) %>%
+  fill(timezone, prev_timezone, .direction = "downup") %>%
+  ungroup() %>%
+  fill(timezone, prev_timezone, .direction = "down") %>%
+  select(-c(session_timestamp, days_to_next_transition)) %>%
+  drop_na(value)
+
+alex_svd_tz
+```
+
+```{r results='hide'}
+tz_order <- c("UTC-07:00", "UTC-06:00", "UTC-05:00", "UTC+01:00", "UTC+02:00", "UTC+08:00", "UTC+09:00")
+
+alex_phase_tz <- alex_svd_tz %>%
+  mutate(
+    theta = hour / 24 * 2 * pi,
+    x = value * cos(theta),
+    y = value * sin(theta)
+  ) %>%
+  group_by(date) %>%
+  summarize(
+    x_mean = mean(x),
+    y_mean = mean(y),
+    phase = atan2(y_mean, x_mean),
+    radius = sqrt(x_mean^2 + y_mean^2),
+    timezone = timezone[1]
+  ) %>%
+  drop_na(phase, timezone) %>%
+  group_by(timezone) %>%
+  mutate(
+    n_tz_obs = n(),
+    timezone = fct_relevel(timezone, !!!tz_order),
+    tz_label = str_glue("{timezone}, n = {n_tz_obs}"),
+    tz_label = fct_reorder(tz_label, timezone, .fun = \(tzs) parse_tz(tzs)[1])
+  ) %>%
+  ungroup()
+
+alex_phase_tz
+```
+
+```{r}
+ggplot(alex_phase_tz, aes(phase)) +
+  geom_density(aes(fill = tz_label), position = "identity", alpha = 0.5) +
+  scale_x_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π"),
+    limits = c(-pi, pi)
+  )
+
+ggplot(alex_phase_tz, aes(phase)) +
+  geom_histogram(aes(fill = tz_label), position = "identity", alpha = 0.5) +
+  scale_x_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π")
+  ) +
+  coord_cartesian(xlim = c(-pi, pi)) +
+  labs(x = "Phase", y = "Count", fill = "Time zone")
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+cols_clear3 <- gg_color_hue(n = 8)
+
+g_phase_violin_alex <- ggplot(alex_phase_tz, aes(timezone, phase)) +
+  geom_violin(aes(fill = tz_label)) +
+  geom_point(alpha = 0.1) +
+  scale_y_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π"),
+    limits = c(-pi, pi)
+  ) +
+  scale_fill_manual(
+    values = c(
+      cols_clear3[2:4], cols_clear3[6:7],
+      "maroon4", "slategrey"
+    )
+  ) +
+  labs(x = "Time zone", y = "Phase", fill = "Time zone",
+       title = bquote(bold("B") ~ "N=1 phases")) +
+  theme(text = element_text(size = 18))
+
+g_phase_violin_alex
+```
+
+Same as a linear model, but the groups are not balanced
+
+```{r}
+aov_alex <- aov(phase ~ timezone, data = alex_phase_tz)
+
+print(aov_alex)
+cat("\n")
+summary(aov_alex)
+
+plot(aov_alex)
+```
+
+```{r results='hide'}
+alex_phase_local <- alex_svd_tz %>%
+  mutate(
+    tz_numeric = parse_tz(timezone),
+    datetime = date + hours(hour),
+    # Rotate by +6 hours to move all phases to the middle of the y range
+    datetime_local = datetime + hours(tz_numeric + 6),
+    date_local = as_date(datetime_local),
+    theta_local = hour(datetime_local) / 24 * 2 * pi,
+    x_local = value * cos(theta_local),
+    y_local = value * sin(theta_local)
+  ) %>%
+  group_by(date_local) %>%
+  # The time zone shift can result in incomplete days, which skew the phase
+  filter(n() == 24) %>%
+  summarize(
+    x_mean_local = mean(x_local),
+    y_mean_local = mean(y_local),
+    phase_local = atan2(y_mean_local, x_mean_local),
+    radius_local = sqrt(x_mean_local^2 + y_mean_local^2),
+    timezone = timezone[1],
+    tz_numeric = tz_numeric[1]
+  ) %>%
+  drop_na(phase_local, timezone) %>%
+  group_by(timezone) %>%
+  mutate(
+    n_tz_obs = n(),
+    timezone = fct_relevel(timezone, !!!tz_order),
+    tz_label = str_glue("{timezone}, n = {n_tz_obs}"),
+    tz_label = fct_reorder(tz_label, timezone, .fun = \(tzs) parse_tz(tzs)[1])
+  ) %>%
+  ungroup()
+
+alex_phase_local
+```
+
+
+```{r}
+ggplot(alex_phase_tz, aes(date, phase)) +
+  geom_line() +
+  geom_point(aes(color = timezone)) +
+  scale_x_date(limits = c(ymd("2023-12-10"), ymd("2024-05-01")))
+```
+
+
+```{r}
+ggplot(alex_phase_local, aes(date_local, phase_local)) +
+  geom_line() +
+  geom_point(aes(color = timezone)) +
+  scale_x_date(limits = c(ymd("2023-12-10"), ymd("2024-05-01"))) +
+  scale_y_continuous(
+    breaks = c(-pi, -pi/2, 0, pi/2, pi), 
+    labels = c("-π", "-π/2", "0", "π/2", "π"),
+    limits = c(-pi, pi)
+  )
+```
+
+
