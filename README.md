@@ -130,7 +130,7 @@ To view the results without running the notebook yourself, you can download `reg
 
 ## Diurnal rhythm phase extraction
 
-The calculation and analysis of diurnal phase is done in `phase_analysis.Rmd`. It is not as extensive as `regress_sleep.Rmd`, but at the same time the analysis is a bit less straightforward, so we will explain some of it here. Again, download and open `phase_analysis.html` in your browser to be able to view results without running the code yourself.
+The calculation and analysis of diurnal phase is done in `phase_analysis.Rmd` for CLEAR-3 and in `visuale_alex.Rmd` for author AL (who is, unsurprisingly, better known as Alex). Both files are not as extensive as `regress_sleep.Rmd`, but at the same time the analysis is a bit less straightforward, so we will explain some of it here. Again, download and open the corresponding HTML files in your browser to be able to view results without running the code yourself. We will focus on `phase_analysis.html` during this explanation.
 
 First, after loading the necessary libraries, the key press data is read because they contain information about the time zone the phone was in while typing. To do the phase analysis reported in the paper, we need to know when the time zone transitions occur, so we track down those rows (by comparing the current and previous time zone via `filter(timezone != prev_timezone)`) and calculate some metrics based on the result (e.g., number of days until the next transition). All of this occurs within-participants, of course.
 
